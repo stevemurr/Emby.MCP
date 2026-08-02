@@ -46,9 +46,10 @@ import uuid
 from contextlib import asynccontextmanager
 from collections.abc import AsyncIterator
 from mcp.server.fastmcp import FastMCP, Context
-from lib_emby_functions import *
+from emby_mcp import __version__
+from emby_mcp.functions import *
 if MY_DEBUG:
-    from lib_emby_debugging import test_emby_functions
+    from emby_mcp.debug import test_emby_functions
 
 # Some statements about the script
 MY_NAME = "Emby.MCP"
@@ -113,22 +114,32 @@ async def app_lifespan(server: FastMCP) ->AsyncIterator[dict]:
             items (list of dict): all of the actual search items
     """
    
-    # Load Emby login environment variables from .env file
+    # Lazy load Emby login environment variables from .env file
     env_file = find_dotenv('.env', usecwd=True)
     if env_file:
         load_dotenv(env_file, override=True)
-        server_url = os.getenv("EMBY_SERVER_URL")
-        username = os.getenv("EMBY_USERNAME")
-        password = os.getenv("EMBY_PASSWORD")
-        verify_ssl = str_to_bool(os.getenv("EMBY_VERIFY_SSL", "True"))
-        max_chunk_size = os.getenv("LLM_MAX_ITEMS")
-        if server_url == None or username == None or password == None:
-            print("Fatal error, missing required variables. Ensure the .env file contains EMBY_SERVER_URL, EMBY_USERNAME, EMBY_PASSWORD", file=sys.stderr)
-            sys.exit(1)
     else:
-        print("Fatal error, cannot find the .env file. Ensure that it exists in the same directory as script.", file=sys.stderr)
+        # Try loading from current directory
+        from pathlib import Path
+        local_env = Path('.env')
+        if local_env.exists():
+            load_dotenv(local_env, override=True)
+    
+    # Extract configuration
+    server_url = os.getenv("EMBY_SERVER_URL")
+    username = os.getenv("EMBY_USERNAME")
+    password = os.getenv("EMBY_PASSWORD")
+    verify_ssl = str_to_bool(os.getenv("EMBY_VERIFY_SSL", "True"))
+    max_chunk_size = os.getenv("LLM_MAX_ITEMS", "100")
+    
+    if not server_url or not username or not password:
+        print(
+            "Fatal error: missing required environment variables. "
+            "Set EMBY_SERVER_URL, EMBY_USERNAME, and EMBY_PASSWORD.",
+            file=sys.stderr,
+        )
         sys.exit(1)
-
+    
     # Login to Emby server
     device_name = MY_HOSTNAME + " (" + MY_PLATFORM + ")"  # shown in Emby server logs & devices page
     client_name = f"{MY_NAME} for AI"  # shown in Emby server logs & devices page
@@ -1151,5 +1162,14 @@ if __name__ == "__main__":
         print(f"Startup checks have completed.\n", file=sys.stderr)
         print(f"Running Emby.MCP in standalone mode, press CTRL-C to exit.\n", file=sys.stderr)
         mcp.run(transport='stdio')
+
+
+def serve():
+    """Run the MCP server."""
+    mcp.run(transport='stdio')
+
+
+if __name__ == "__main__":
+    pass
 
 #--------------------------------------------------

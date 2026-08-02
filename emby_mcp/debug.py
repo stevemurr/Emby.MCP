@@ -32,7 +32,7 @@ import os
 import sys
 import emby_client
 from emby_client.rest import ApiException
-from lib_emby_functions import *
+from emby_mcp.functions import *
 
 def test_emby_functions(MY_NAME, MY_VERSION, MY_PLATFORM, MY_HOSTNAME) ->None:
     """
