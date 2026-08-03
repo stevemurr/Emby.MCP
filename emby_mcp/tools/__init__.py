@@ -1,1 +1,0 @@
-"""Emby MCP tools."""
