@@ -7,8 +7,8 @@ import sys
 import pytest
 from unittest.mock import patch, MagicMock
 
-import emby_mcp_server
-from emby_mcp_server import app_lifespan, configure_utf8_streams, main, serve
+from emby_mcp import server as emby_server
+from emby_mcp.server import app_lifespan, configure_utf8_streams, main, serve
 
 
 ENV = {
@@ -41,9 +41,9 @@ def run_lifespan(collect=None):
 def logged_in():
     """Patch out the network so app_lifespan can run against a fake Emby server."""
     auth_result = {'success': True, 'api_client': MagicMock()}
-    with patch('emby_mcp_server.find_dotenv', return_value=""), \
-         patch('emby_mcp_server.authenticate_with_emby', return_value=auth_result) as auth, \
-         patch('emby_mcp_server.logout_from_emby', return_value={'success': True}) as logout:
+    with patch('emby_mcp.server.find_dotenv', return_value=""), \
+         patch('emby_mcp.server.authenticate_with_emby', return_value=auth_result) as auth, \
+         patch('emby_mcp.server.logout_from_emby', return_value={'success': True}) as logout:
         yield auth, logout
 
 
@@ -127,8 +127,8 @@ class TestAppLifespan:
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value=""), \
-             patch('emby_mcp_server.authenticate_with_emby',
+        with patch('emby_mcp.server.find_dotenv', return_value=""), \
+             patch('emby_mcp.server.authenticate_with_emby',
                    return_value={'success': False, 'error': 'bad password'}):
             with pytest.raises(SystemExit) as exit_info:
                 run_lifespan()
@@ -139,8 +139,8 @@ class TestAppLifespan:
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv') as load:
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv') as load:
             run_lifespan()
 
         assert load.call_args[0][0] == "/somewhere/.env"
@@ -159,7 +159,7 @@ class TestConfigureUtf8Streams:
         monkeypatch.setattr(sys, 'stdout', fake)
         monkeypatch.setattr(sys, 'stderr', fake)
 
-        with patch('emby_mcp_server.io.TextIOWrapper') as wrapper:
+        with patch('emby_mcp.server.io.TextIOWrapper') as wrapper:
             configure_utf8_streams()
 
         assert wrapper.call_count == 3
@@ -171,8 +171,8 @@ class TestServe:
     """Tests for the entry point used by the emby-mcp CLI."""
 
     def test_stdio_transport_is_started(self):
-        with patch('emby_mcp_server.configure_utf8_streams') as configure, \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+        with patch('emby_mcp.server.configure_utf8_streams') as configure, \
+             patch.object(emby_server.mcp, 'run') as run:
             serve()
 
         configure.assert_called_once()
@@ -181,8 +181,8 @@ class TestServe:
     def test_streams_are_configured_before_serving(self):
         """Wrapping the streams after mcp.run() starts would be too late to matter."""
         order = []
-        with patch('emby_mcp_server.configure_utf8_streams', side_effect=lambda: order.append('configure')), \
-             patch.object(emby_mcp_server.mcp, 'run', side_effect=lambda **kwargs: order.append('run')):
+        with patch('emby_mcp.server.configure_utf8_streams', side_effect=lambda: order.append('configure')), \
+             patch.object(emby_server.mcp, 'run', side_effect=lambda **kwargs: order.append('run')):
             serve()
 
         assert order == ['configure', 'run']
@@ -194,29 +194,29 @@ class TestMain:
     @pytest.fixture(autouse=True)
     def quiet_streams(self):
         """main() calls configure_utf8_streams, which would replace pytest's streams."""
-        with patch('emby_mcp_server.configure_utf8_streams'):
+        with patch('emby_mcp.server.configure_utf8_streams'):
             yield
 
     def test_startup_checks_run_before_serving(self, monkeypatch):
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv'), \
-             patch('emby_mcp_server.authenticate_with_emby',
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv'), \
+             patch('emby_mcp.server.authenticate_with_emby',
                    return_value={'success': True, 'api_client': MagicMock()}), \
-             patch('emby_mcp_server.get_library_list',
+             patch('emby_mcp.server.get_library_list',
                    return_value={'success': True, 'items': [{'name': 'Music'}]}), \
-             patch('emby_mcp_server.logout_from_emby', return_value={'success': True}) as logout, \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+             patch('emby_mcp.server.logout_from_emby', return_value={'success': True}) as logout, \
+             patch.object(emby_server.mcp, 'run') as run:
             main()
 
         logout.assert_called_once()
         assert run.call_args[1] == {'transport': 'stdio'}
 
     def test_missing_env_file_stops_startup(self):
-        with patch('emby_mcp_server.find_dotenv', return_value=""), \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+        with patch('emby_mcp.server.find_dotenv', return_value=""), \
+             patch.object(emby_server.mcp, 'run') as run:
             with pytest.raises(SystemExit) as exit_info:
                 main()
 
@@ -227,9 +227,9 @@ class TestMain:
         for name in ENV:
             monkeypatch.delenv(name, raising=False)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv'), \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv'), \
+             patch.object(emby_server.mcp, 'run') as run:
             with pytest.raises(SystemExit) as exit_info:
                 main()
 
@@ -240,11 +240,11 @@ class TestMain:
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv'), \
-             patch('emby_mcp_server.authenticate_with_emby',
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv'), \
+             patch('emby_mcp.server.authenticate_with_emby',
                    return_value={'success': False, 'error': 'bad password'}), \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+             patch.object(emby_server.mcp, 'run') as run:
             with pytest.raises(SystemExit) as exit_info:
                 main()
 
@@ -256,13 +256,13 @@ class TestMain:
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv'), \
-             patch('emby_mcp_server.authenticate_with_emby',
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv'), \
+             patch('emby_mcp.server.authenticate_with_emby',
                    return_value={'success': True, 'api_client': MagicMock()}), \
-             patch('emby_mcp_server.get_library_list',
+             patch('emby_mcp.server.get_library_list',
                    return_value={'success': False, 'error': 'access denied'}), \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+             patch.object(emby_server.mcp, 'run') as run:
             with pytest.raises(SystemExit) as exit_info:
                 main()
 
@@ -273,15 +273,15 @@ class TestMain:
         for name, value in ENV.items():
             monkeypatch.setenv(name, value)
 
-        with patch('emby_mcp_server.find_dotenv', return_value="/somewhere/.env"), \
-             patch('emby_mcp_server.load_dotenv'), \
-             patch('emby_mcp_server.authenticate_with_emby',
+        with patch('emby_mcp.server.find_dotenv', return_value="/somewhere/.env"), \
+             patch('emby_mcp.server.load_dotenv'), \
+             patch('emby_mcp.server.authenticate_with_emby',
                    return_value={'success': True, 'api_client': MagicMock()}), \
-             patch('emby_mcp_server.get_library_list',
+             patch('emby_mcp.server.get_library_list',
                    return_value={'success': True, 'items': []}), \
-             patch('emby_mcp_server.logout_from_emby',
+             patch('emby_mcp.server.logout_from_emby',
                    return_value={'success': False, 'error': 'session lost'}), \
-             patch.object(emby_mcp_server.mcp, 'run') as run:
+             patch.object(emby_server.mcp, 'run') as run:
             with pytest.raises(SystemExit) as exit_info:
                 main()
 

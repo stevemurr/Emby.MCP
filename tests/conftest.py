@@ -19,11 +19,11 @@ def isolate_dotenv():
     which discovery blocking alone does not cover, so its loader is stubbed as well. Tests
     that assert on loading patch load_dotenv themselves, and the inner patch wins.
     """
-    import emby_mcp_server  # noqa: F401  (imported for patching, not for use)
+    from emby_mcp import server as emby_server  # noqa: F401  (imported for patching)
 
     with patch("emby_mcp.config.find_dotenv", return_value=""), \
-         patch("emby_mcp_server.find_dotenv", return_value=""), \
-         patch("emby_mcp_server.load_dotenv"):
+         patch("emby_mcp.server.find_dotenv", return_value=""), \
+         patch("emby_mcp.server.load_dotenv"):
         yield
 
 
@@ -43,11 +43,11 @@ def auth_context():
 @pytest.fixture
 def mcp_context(auth_context):
     """Patch mcp.get_context() so the tools can run outside a live MCP session."""
-    import emby_mcp_server
+    from emby_mcp import server as emby_server
 
     ctx = MagicMock()
     ctx.request_context.lifespan_context = auth_context
-    with patch.object(emby_mcp_server.mcp, 'get_context', return_value=ctx):
+    with patch.object(emby_server.mcp, 'get_context', return_value=ctx):
         yield auth_context
 
 

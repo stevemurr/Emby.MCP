@@ -225,7 +225,7 @@ class TestServe:
 
     def test_serve_runs_the_mcp_server(self, no_env):
         """The command must call the server, not recurse into itself."""
-        with patch("emby_mcp.cli.main.emby_mcp_server.serve") as mock_serve:
+        with patch("emby_mcp.cli.main.emby_server.serve") as mock_serve:
             result = runner.invoke(app, ["serve"])
 
         assert result.exit_code == 0

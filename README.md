@@ -255,15 +255,17 @@ A session usually opens like this:
 ## Architecture
 
 ```
-emby_mcp_server.py        MCP tool definitions, FastMCP instance, lifespan, entry points
 emby_mcp/
+├── server.py             MCP tool definitions, FastMCP instance, lifespan, entry points
 ├── functions.py          Emby API layer — all the real work
 ├── sdk_patches.py        Runtime corrections to the embyclient SDK
 ├── config.py             EmbyConfig, reads .env and the environment
 ├── debug.py              Interactive developer harness
-├── server.py             Re-export shim so the server is importable as emby_mcp.server
 └── cli/main.py           The emby-mcp Typer CLI
 ```
+
+Everything lives in the `emby_mcp` package; there is no top-level module. The server is
+reached as `emby_mcp.server`, and `emby-mcp serve` is the supported way to run it.
 
 **Lifespan and context.** `app_lifespan` runs once at client startup: it logs into Emby and yields a
 context dict holding the API client, user ID, cached library list, current library, and search chunking

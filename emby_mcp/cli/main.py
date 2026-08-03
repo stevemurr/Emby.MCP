@@ -11,7 +11,7 @@ from emby_mcp import __version__
 from emby_mcp.config import EmbyConfig
 from emby_mcp.functions import *
 from emby_mcp.debug import test_emby_functions
-import emby_mcp_server
+from emby_mcp import server as emby_server
 
 app = typer.Typer(
     name="emby-mcp",
@@ -103,7 +103,7 @@ def login(ctx: typer.Context, env_file: Optional[str] = None) -> dict:
 @app.command()
 def serve():
     """Run the MCP server."""
-    emby_mcp_server.serve()
+    emby_server.serve()
 
 
 @app.command()

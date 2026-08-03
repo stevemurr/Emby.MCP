@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Model Context Protocol (MCP) server that connects an Emby media server to an AI client such as Claude Desktop.
-See emby_mcp_server.py for details.
+See README.md for details.
 
 Copyright (C) 2025 Dominic Search <code@angeltek.co.uk>
 

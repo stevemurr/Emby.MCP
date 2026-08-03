@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Model Context Protocol (MCP) server that connects an Emby media server to an AI client such as Claude Desktop.
-See emby_mcp_server.py for details.
+See README.md for details.
 
 Copyright (C) 2025 Dominic Search <code@angeltek.co.uk>
 
@@ -37,7 +37,7 @@ from emby_mcp.functions import *
 def test_emby_functions(MY_NAME, MY_VERSION, MY_PLATFORM, MY_HOSTNAME) ->None:
     """
     Executes the Emby functions sequentially for development and basic testing / debugging.
-    Set 'MY_DEBUG=True' at top of emby_mcp_server.py , then interactively run *that* script.
+    Set 'MY_DEBUG=True' at top of emby_mcp/server.py, or run 'emby-mcp debug'.
     The script's standard output can be redirected to a file to capture full data that the 
     interactive terminal may otherwise truncate - prompts & errors are sent to standard error.
     Enable different test blocks below by setting 'if True:' instead of 'if False:' at their start    
