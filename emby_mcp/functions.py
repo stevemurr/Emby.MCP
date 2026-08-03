@@ -21,13 +21,13 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 # Functions for Accessing Emby Media Server
 #==================================================
 
-from typing import Optional, TypedDict, NotRequired, Any, Unpack
-from dataclasses import dataclass
-from unidecode import unidecode
-import json
 import uuid
+from typing import Any, NotRequired, Optional, TypedDict, Unpack
+
 import emby_client
 from emby_client.rest import ApiException
+from unidecode import unidecode
+
 from emby_mcp.sdk_patches import apply_sdk_patches
 
 # The published embyclient SDK cannot authenticate or query item access without these
@@ -35,11 +35,44 @@ from emby_mcp.sdk_patches import apply_sdk_patches
 # the debug harness all reach Emby through this module.
 apply_sdk_patches()
 
-#--------------------------------------------------
-# Internal Helpers
-#-------------------------
+# Emby represents time in 100-nanosecond ticks.
+_TICKS_PER_SECOND = 10_000_000
+_TICKS_PER_MILLISECOND = 10_000
 
-def _ticks_to_hhmmss(run_time_ticks: Optional[int]) ->str:
+_PLAYABLE_MEDIA_TYPES = ("Audio", "Video")
+_ITEM_FIELDS = (
+    "Genres,MediaSources,DateCreated,Overview,ProductionYear,PremiereDate,Path"
+)
+_PLAYLIST_FIELDS = "Genres,MediaSources,DateCreated,Overview"
+_PLAYLIST_LIBRARY_FIELDS = (
+    "Genres,MediaSources,DateCreated,Overview,ProductionYear,PremiereDate,ParentId"
+)
+_PLAYSTATE_COMMANDS = (
+    "Stop",
+    "Pause",
+    "Unpause",
+    "NextTrack",
+    "PreviousTrack",
+    "Seek",
+    "Rewind",
+    "FastForward",
+    "PlayPause",
+    "SeekRelative",
+)
+_RELATIVE_SEEK_COMMANDS = frozenset({"Rewind", "FastForward", "SeekRelative"})
+_DEFAULT_RELATIVE_SEEK_MS = 30_000
+
+# --------------------------------------------------
+# Internal Helpers
+# --------------------------------------------------
+
+def _api_failure(error: Exception) -> dict[str, Any]:
+    """Return the common result shape used for Emby API failures."""
+
+    return {"success": False, "error": str(error)}
+
+
+def _ticks_to_hhmmss(run_time_ticks: Optional[int]) -> str:
     """
     Convert an Emby duration in ticks (100 nanoseconds) into a hh:mm:ss string.
 
@@ -52,37 +85,266 @@ def _ticks_to_hhmmss(run_time_ticks: Optional[int]) ->str:
 
     if not run_time_ticks or run_time_ticks <= 0:
         return ""
-    total_seconds = int(run_time_ticks / 10000000) # convert from ticks
-    tthours = total_seconds // 3600
-    ttmins = (total_seconds % 3600) // 60
-    ttsecs = total_seconds % 60
-    return f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
+    total_seconds = int(run_time_ticks / _TICKS_PER_SECOND)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
-#--------------------------------------------------
 
-def _extract_lyrics(media_sources: list) ->str:
-    """
-    Pull the lyrics text out of the reduced 'media_sources' structure built by the item functions.
-    Emby stores lyrics as the 'extradata' of a text subtitle stream titled 'lyrics'.
+def _extract_item_lyrics(item: Any) -> str:
+    """Extract lyrics stored in an item's text subtitle streams."""
 
-    Args:
-        media_sources (list of dict): The reduced media sources of a single item.
-
-    Returns:
-        str: The lyrics text, or an empty string if the item has none.
-    """
-
-    for media_source in media_sources or []:
-        for stream in media_source.get('media_streams', []):
-            if stream.get('extradata'):
-                return stream['extradata']
+    for media_source in item.media_sources or []:
+        for stream in media_source.media_streams or []:
+            if (
+                stream.is_text_subtitle_stream is not None
+                and stream.is_text_subtitle_stream is True
+                and stream.title is not None
+                and stream.title.lower() == "lyrics"
+            ):
+                lyrics = stream.extradata if hasattr(stream, "extradata") else None
+                if lyrics:
+                    return lyrics
     return ""
+
+
+def _serialize_media_item(
+    item: Any,
+    *,
+    include_lyrics: bool = False,
+) -> dict[str, Any]:
+    """Return fields shared by search results, playlists, and play queues."""
+
+    result = {
+        "title": item.name if item.name else "",
+        "artists": list(item.artists) if item.artists else [],
+        "album": item.album if item.album else "",
+        "album_id": item.album_id if item.album_id else "",
+        "album_artist": item.album_artist if item.album_artist else "",
+        "disk_number": item.parent_index_number if item.parent_index_number else "",
+        "track_number": item.index_number if item.index_number else "",
+        "creation_date": item.date_created.isoformat() if item.date_created else "",
+        "premiere_date": item.premiere_date.isoformat() if item.premiere_date else "",
+        "production_year": item.production_year if item.production_year else "",
+        "genres": item.genres if item.genres else [],
+        "overview": item.overview if item.overview else "",
+    }
+    if include_lyrics:
+        result["lyrics"] = _extract_item_lyrics(item)
+    result.update(
+        {
+            "media_type": item.media_type if item.media_type else "",
+            "bitrate": item.bitrate if item.bitrate else "",
+            "run_time": _ticks_to_hhmmss(item.run_time_ticks),
+            "item_id": item.id if item.id else "",
+        }
+    )
+    return result
+
+
+def _serialize_search_item(item: Any) -> dict[str, Any]:
+    """Serialize an Emby item for ``get_items``."""
+
+    result = _serialize_media_item(item, include_lyrics=True)
+    result["file_path"] = item.path if item.path else ""
+    return result
+
+
+def _serialize_playlist_item(item: Any, index: int) -> dict[str, Any]:
+    """Serialize one playable item in a playlist."""
+
+    result = _serialize_media_item(item, include_lyrics=True)
+    result["playlist_item_number"] = (
+        item.playlist_item_id if item.playlist_item_id else ""
+    )
+    result["playlist_item_index"] = str(index)
+    return result
+
+
+def _serialize_playqueue_item(item: Any) -> dict[str, Any]:
+    """Serialize one item in a player queue."""
+
+    result = _serialize_media_item(item)
+    result["playlist_item_id"] = item.playlist_item_id if item.playlist_item_id else ""
+    return result
+
+
+def _find_playlist_library_id(available_libraries: list[dict[str, Any]]) -> str:
+    """Return the first library whose Emby collection type is ``playlists``."""
+
+    for library in available_libraries:
+        if library["type"] == "playlists":
+            return library["id"]
+    return ""
+
+
+def _serialize_playlist(item: Any) -> dict[str, Any]:
+    """Serialize a playlist item returned by Emby's item query."""
+
+    return {
+        "name": item.name if item.name else "",
+        "overview": item.overview if item.overview else "",
+        "genres": item.genres if item.genres else [],
+        "date_created": item.date_created.isoformat() if item.date_created else "",
+        "run_time": _ticks_to_hhmmss(item.run_time_ticks),
+        "user_access": [],
+        "can_share": False,
+        "media_type": item.type if item.type else "",
+        "playlist_id": item.id if item.id else "",
+    }
+
+
+def _get_playlist_access(
+    user_api: Any,
+    playlist_id: str,
+    current_user_id: str,
+) -> tuple[list[dict[str, str]], bool]:
+    """Return playlist access entries and whether the current user can share it."""
+
+    try:
+        response = user_api.get_users_itemaccess(item_id=playlist_id)
+        if response.total_record_count <= 0:
+            return [], False
+
+        access = [
+            {
+                "user_name": user.name if user.name else "",
+                "user_id": user.id if user.id else "",
+                "access_level": (
+                    user.user_item_share_level if user.user_item_share_level else ""
+                ),
+            }
+            for user in response.items
+        ]
+        can_share = any(
+            user["user_id"] == current_user_id
+            and user["access_level"] in {"Manage", "ManageDelete"}
+            for user in access
+        )
+        return access, can_share
+    except ApiException:
+        # Access lookups often fail for playlists the current user does not own.
+        return [], False
+
+
+def _fetch_sessions(sessions_api: Any, user_id: Optional[str]) -> list[Any]:
+    """Fetch all sessions or those controllable by a particular user."""
+
+    if user_id == "":
+        return sessions_api.get_sessions()
+    return sessions_api.get_sessions(controllable_by_user_id=user_id)
+
+
+def _is_local_endpoint(endpoint: Optional[str]) -> bool:
+    """Return whether a session endpoint is local to the Emby server."""
+
+    return endpoint is not None and (
+        endpoint == "::1" or endpoint == "127.0.0.1"
+    )
+
+
+def _supports_media_type(item: dict[str, Any], media_type: Optional[str]) -> bool:
+    """Return whether a serialized session supports the requested media type."""
+
+    if media_type == "":
+        return True
+    return any(
+        candidate.lower() == media_type.lower()
+        for candidate in item["media_types"]
+    )
+
+
+def _serialize_player_session(session: Any) -> dict[str, Any]:
+    """Serialize the player and its optional now-playing state."""
+
+    item = {
+        "client_name": session.client,
+        "session_id": session.id,
+        "device_id": session.device_id,
+        "device_name": session.device_name,
+        "device_ip_address": session.remote_end_point,
+        "local_to_media_server": _is_local_endpoint(session.remote_end_point),
+        "media_types": (
+            session.playable_media_types
+            if session.playable_media_types is not None
+            else []
+        ),
+        "now_playing_item": (
+            session.now_playing_item
+            if session.now_playing_item is not None
+            else None
+        ),
+        "play_state": session.play_state if session.play_state is not None else None,
+    }
+
+    now_playing_item = item["now_playing_item"]
+    if now_playing_item:
+        item.update(
+            {
+                "now_playing_title": now_playing_item.name,
+                "now_playing_artists": now_playing_item.artists,
+                "now_playing_album": now_playing_item.album,
+                "now_playing_track_number": now_playing_item.index_number,
+                "now_playing_disk_number": now_playing_item.parent_index_number,
+                "now_playing_item_id": now_playing_item.id,
+            }
+        )
+        if now_playing_item.run_time_ticks:
+            item["now_playing_total_milliseconds"] = (
+                int(now_playing_item.run_time_ticks / _TICKS_PER_MILLISECOND)
+            )
+            item["now_playing_total_time"] = _ticks_to_hhmmss(
+                now_playing_item.run_time_ticks
+            )
+        else:
+            item["now_playing_total_milliseconds"] = None
+            item["now_playing_total_time"] = ""
+        item.pop("now_playing_item")
+
+    play_state = item["play_state"]
+    if play_state:
+        if play_state.position_ticks is not None:
+            item["now_playing_position_milliseconds"] = (
+                int(play_state.position_ticks / _TICKS_PER_MILLISECOND)
+            )
+            item["now_playing_position_time"] = (
+                _ticks_to_hhmmss(play_state.position_ticks) or "00:00:00"
+            )
+        else:
+            item["now_playing_position_milliseconds"] = None
+            item["now_playing_position_time"] = ""
+        item["now_playing_is_paused"] = play_state.is_paused
+        item.pop("play_state")
+
+    return item
+
+
+def _prepare_playstate_command(command: str, time_ms: int) -> tuple[str, int]:
+    """Apply seek defaults and translate skip commands for Emby players."""
+
+    if time_ms == 0 and command in _RELATIVE_SEEK_COMMANDS:
+        time_ms = _DEFAULT_RELATIVE_SEEK_MS
+
+    time_ticks = time_ms * _TICKS_PER_MILLISECOND
+    if command == "Rewind":
+        return "SeekRelative", -time_ticks
+    if command == "FastForward":
+        return "SeekRelative", time_ticks
+    return command, time_ticks
 
 #--------------------------------------------------
 # Login & Logout Functions
 #-------------------------
 
-def authenticate_with_emby(server_url: str, username: str, password: str, client_name: str = "EmbyPythonClient", client_version: str ="1.0", device_name: str ="EmbyPythonDevice", verify_ssl: Optional[bool] = True) ->dict:
+def authenticate_with_emby(
+    server_url: str,
+    username: str,
+    password: str,
+    client_name: str = "EmbyPythonClient",
+    client_version: str = "1.0",
+    device_name: str = "EmbyPythonDevice",
+    verify_ssl: Optional[bool] = True,
+) -> dict:
     """
     Login to the Emby server using an username and password for an existing user on that server.
     
@@ -127,7 +389,10 @@ def authenticate_with_emby(server_url: str, username: str, password: str, client
     # Format: Emby UserId="", Client="client_name", Device="device_name", DeviceId="unique_id", Version="1.0"
     
     device_id = uuid.uuid4()                                # shown in Emby server logs
-    authorization_header = f'Emby UserId="", Client="{client_name}", Device="{device_name}", DeviceId="{device_id}", Version="{client_version}"'
+    authorization_header = (
+        f'Emby UserId="", Client="{client_name}", Device="{device_name}", '
+        f'DeviceId="{device_id}", Version="{client_version}"'
+    )
     
     try:
         # Authenticate
@@ -154,15 +419,16 @@ def authenticate_with_emby(server_url: str, username: str, password: str, client
             'api_client': e_api_client  # Return configured client for future use
         }
         
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def create_authenticated_client(server_url: str, access_token: str, verify_ssl: Optional[bool] = True) ->object:
+def create_authenticated_client(
+    server_url: str,
+    access_token: str,
+    verify_ssl: Optional[bool] = True,
+) -> object:
     """
     Create an authenticated API client using an existing access token
 
@@ -186,7 +452,7 @@ def create_authenticated_client(server_url: str, access_token: str, verify_ssl: 
 
 #--------------------------------------------------
 
-def logout_from_emby(e_api_client: object) ->dict:
+def logout_from_emby(e_api_client: object) -> dict:
     """
     Logs out of the Emby server revoking the access token
     
@@ -201,22 +467,17 @@ def logout_from_emby(e_api_client: object) ->dict:
 
     api_instance = emby_client.SessionsServiceApi(e_api_client)
     try:
-        api_response = api_instance.post_sessions_logout()
-        return {
-            'success': True
-        }
+        api_instance.post_sessions_logout()
+        return {"success": True}
 
-    except ApiException as e:
-       return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 # Library & Genre Functions
 #-------------------------
 
-def get_library_list(e_api_client: object) ->dict:
+def get_library_list(e_api_client: object) -> dict:
     """
     Get a list of libraries from the Emby server. Only includes 'CollectionFolder' items.
 
@@ -237,36 +498,31 @@ def get_library_list(e_api_client: object) ->dict:
     try:
         # Gets media libraries
         api_response = api_instance.get_library_mediafolders()
-        total_count = api_response.total_record_count
-        if total_count > 0:
-            items_list = api_response.items
-            # Only include 'CollectionFolder' items
-            filtered_items = [
+        filtered_items = (
+            [
                 {
-                    'name': item.name,
-                    'type': item.collection_type,
-                    'id': item.id
+                    "name": item.name,
+                    "type": item.collection_type,
+                    "id": item.id,
                 }
-                for item in items_list
-                if item.type == 'CollectionFolder'
+                for item in api_response.items
+                if item.type == "CollectionFolder"
             ]
-        else:
-            filtered_items = []
+            if api_response.total_record_count > 0
+            else []
+        )
 
         return {
             'success': True,
             'items': filtered_items
         }
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def set_current_library(available_libraries:list, name:str = "") ->dict:
+def set_current_library(available_libraries: list, name: str = "") -> dict:
     """
     Set the current library.
     
@@ -284,38 +540,27 @@ def set_current_library(available_libraries:list, name:str = "") ->dict:
         error (str):  An error message if the request failed, otherwise None.
     """
     
-    if name != "":
-        if available_libraries != None and len(available_libraries) > 0:
-            found = False
-            for library in available_libraries:
-                if library['name'].lower() == name.lower():
-                    current_library = library
-                    found = True
-                    break
-            if found:
-                return {
-                        'success': True,
-                        'library': current_library
-                }
-            else:
-                return {
-                        'success': False,
-                        'error': 'Library not found: ' + name
-                }
-        else:
-            return {
-                    'success': False,
-                    'error': 'No libraries are available.'
-            }
-    else:
+    if name == "":
         return {
-                'success': False,
-                'error': 'No library name was supplied.'
+            "success": False,
+            "error": "No library name was supplied.",
         }
+    if available_libraries is None or len(available_libraries) == 0:
+        return {
+            "success": False,
+            "error": "No libraries are available.",
+        }
+
+    wanted_name = name.lower()
+    for library in available_libraries:
+        if library["name"].lower() == wanted_name:
+            return {"success": True, "library": library}
+
+    return {"success": False, "error": "Library not found: " + name}
 
 #--------------------------------------------------
 
-def get_genre_list(e_api_client: object, library_id: str = "") ->dict:
+def get_genre_list(e_api_client: object, library_id: str = "") -> dict:
     """
     Get a list of genres from the Emby server that are available in the given library.
     
@@ -343,11 +588,8 @@ def get_genre_list(e_api_client: object, library_id: str = "") ->dict:
             'genres': [genre.name for genre in api_response.items]
         }
         
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 # Item Functions
@@ -366,8 +608,54 @@ class getitems_kwargs(TypedDict, total=False):
     is_played: NotRequired[bool]
     is_favorite: NotRequired[bool]
     limit: NotRequired[str]
-    
-def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs: Unpack[getitems_kwargs]) ->dict:
+
+
+_ITEM_QUERY_ALIASES = {
+    "artist": "artists",
+    "genre": "genres",
+    "first_date": "min_start_date",
+    "last_date": "max_end_date",
+}
+_ITEM_FILTERS = {
+    "is_unplayed": "IsUnplayed",
+    "is_played": "IsPlayed",
+    "is_favorite": "IsFavorite",
+}
+
+
+def _build_item_query(
+    kwargs: dict[str, Any],
+) -> tuple[dict[str, Any], str]:
+    """Translate public search options into Emby's query parameters."""
+
+    query: dict[str, Any] = {}
+    filters: list[str] = []
+    lyrics_search = ""
+
+    for key, value in kwargs.items():
+        if value is None or value == "":
+            continue
+        if key == "lyrics":
+            # Emby does not support lyrics search, so it is applied locally.
+            lyrics_search = value
+        elif key in _ITEM_FILTERS:
+            if value:
+                filters.append(_ITEM_FILTERS[key])
+        else:
+            query[_ITEM_QUERY_ALIASES.get(key, key)] = value
+
+    if filters:
+        query["filters"] = ",".join(filters)
+
+    return query, lyrics_search
+
+
+def get_items(
+    e_api_client: object,
+    user_id: str,
+    library_id: str = "",
+    **kwargs: Unpack[getitems_kwargs],
+) -> dict:
 
     """
     Get a list of media items from the Emby server, filtered by library and search query terms.
@@ -417,54 +705,11 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
         error (str): An error message if the request failed, otherwise None.
     """
 
-    # Translate our notion of query strings into Emby's notion
-    kwcooked = {}
-    filters = ""
-    lyrics_search = ""
-    for key in kwargs:
-        match key:
-            case "artist":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["artists"] = kwargs[key]
-            case "genre":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["genres"] = kwargs[key]
-            case "lyrics":
-                # Emby does not support lyrics search, so we do this ourselves
-                if kwargs[key] is not None and kwargs[key] != "":
-                    lyrics_search = kwargs[key]
-            case "first_date":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["min_start_date"] = kwargs[key]
-            case "last_date":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["max_end_date"] = kwargs[key]
-            case "is_unplayed":
-                # Only apply the filter when the caller actually asked for it
-                if kwargs[key]:
-                    if filters != "":
-                        filters = f"{filters},"
-                    filters = f"{filters}IsUnplayed"
-            case "is_played":
-                if kwargs[key]:
-                    if filters != "":
-                        filters = f"{filters},"
-                    filters = f"{filters}IsPlayed"
-            case "is_favorite":
-                if kwargs[key]:
-                    if filters != "":
-                        filters = f"{filters},"
-                    filters = f"{filters}IsFavorite"
-            case _:
-                if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked[key] = kwargs[key]
-    if filters != "":
-        kwcooked["filters"] = filters
+    kwcooked, lyrics_search = _build_item_query(kwargs)
     
     # Run query and process results
     api_instance = emby_client.ItemsServiceApi(e_api_client)
-    extrafields='Genres,MediaSources,DateCreated,Overview,ProductionYear,PremiereDate,Path'
-    media_types = 'Audio,Video' # Only return these media types
+    media_types = ",".join(_PLAYABLE_MEDIA_TYPES)
 
     # Emby returns HTTP 500 (a SQLite exception) whenever the Genres filter is combined with
     # MediaTypes, for every library and every MediaTypes value, which would make every genre
@@ -476,63 +721,32 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
         kwcooked["media_types"] = media_types
 
     try:
-        api_response = api_instance.get_users_by_userid_items(user_id, parent_id=library_id, recursive=True, fields=extrafields, **kwcooked)
+        api_response = api_instance.get_users_by_userid_items(
+            user_id,
+            parent_id=library_id,
+            recursive=True,
+            fields=_ITEM_FIELDS,
+            **kwcooked,
+        )
         total_count = api_response.total_record_count
         if total_count > 0:
             items_list = api_response.items
             if filter_media_types_locally:
-                wanted_media_types = media_types.split(",")
-                items_list = [item for item in items_list if item.media_type in wanted_media_types]
+                items_list = [
+                    item
+                    for item in items_list
+                    if item.media_type in _PLAYABLE_MEDIA_TYPES
+                ]
                 total_count = len(items_list)
-            # Return only a subset of fields
-            filtered_items = [
-                {
-                    'title': item.name if item.name else "",
-                    'artists': [artist for artist in item.artists] if item.artists else [],
-                    'album': item.album if item.album else "",
-                    'album_id': item.album_id if item.album_id else "",
-                    'album_artist': item.album_artist if item.album_artist else "",
-                    'disk_number': item.parent_index_number if item.parent_index_number else "",
-                    'track_number': item.index_number if item.index_number else "",
-                    'creation_date': item.date_created.isoformat() if item.date_created else "",
-                    'premiere_date': item.premiere_date.isoformat() if item.premiere_date else "",
-                    'production_year': item.production_year if item.production_year else "",
-                    'genres': item.genres if item.genres else [],
-                    'overview': item.overview if item.overview else "",
-                    'lyrics': "",  # Placeholder for lyrics, will be filled later
-                    # Extract 'extradata' from 'media sources' that are text subtitles with title 'lyrics'
-                    'media_sources': [
-                        {
-                            'media_streams': [
-                                {'extradata': stream.extradata if hasattr(stream, 'extradata') else None}
-                                for stream in media_source.media_streams
-                                if stream.is_text_subtitle_stream is not None and stream.is_text_subtitle_stream == True and stream.title is not None and stream.title.lower() == 'lyrics'
-                            ] if media_source.media_streams else []
-                        }
-                        for media_source in item.media_sources
-                    ] if item.media_sources else [],
-                    'media_type': item.media_type if item.media_type else "",
-                    'bitrate': item.bitrate if item.bitrate else "",
-                    'run_time_ticks': item.run_time_ticks if item.run_time_ticks else 0,
-                    'run_time': "",  # Placeholder for run time, will be filled later
-                    'item_id': item.id if item.id else "",
-                    'file_path': item.path if item.path else ""  # File path of the item
-                }
-                for item in items_list
-            ]
-            
-            # Extract the lyrics string from the 'media sources' object, if available
-            for item in filtered_items:
-                # update the item 'lyrics' string and remove the now redundant 'media_sources' key
-                item['lyrics'] = _extract_lyrics(item.pop('media_sources', []))
-                item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
+            filtered_items = [_serialize_search_item(item) for item in items_list]
 
-            # Perform lyric searching by matching against the lyric or overview fields of each item returned by Emby, after convertion to lower case ASCII
+            # Match lyrics and overviews after converting both to lowercase ASCII.
             if lyrics_search != "":
                 needle = unidecode(lyrics_search.casefold())
                 filtered_items = [
                     item for item in filtered_items
-                    if needle in unidecode(item['lyrics'].casefold()) or needle in unidecode(item['overview'].casefold())
+                    if needle in unidecode(item['lyrics'].casefold())
+                    or needle in unidecode(item['overview'].casefold())
                 ]
                 # Emby counted the items before we filtered them, so report the count we are actually returning
                 total_count = len(filtered_items)
@@ -545,17 +759,19 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
             'items': filtered_items
         }
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 # Playlist Functions
 #-------------------------
 
-def get_playlists(e_api_client: object, user_id: str, available_libraries:list, playlist_id: Optional[str] = "") ->dict:
+def get_playlists(
+    e_api_client: object,
+    user_id: str,
+    available_libraries: list,
+    playlist_id: Optional[str] = "",
+) -> dict:
     """
     Get a list of playlists from the Emby server, assuming all playlists are in the 'Playlists' library.
     Includes only 'CollectionFolder' items of media_type 'Playlist'.
@@ -585,106 +801,64 @@ def get_playlists(e_api_client: object, user_id: str, available_libraries:list, 
         error (str):  An error message if the request failed, otherwise None.
     """        
 
-    if available_libraries != None and len(available_libraries) > 0:
-        # Use the first playlist library in the list to get playlists
-        library_id = ""
-        for library in available_libraries:
-            if library['type'] == 'playlists':
-                library_id = library['id']
-                break
-        if library_id != "":
-
-            api_instance = emby_client.ItemsServiceApi(e_api_client)
-            extrafields='Genres,MediaSources,DateCreated,Overview,ProductionYear,PremiereDate,ParentId'
-            kwargs ={}
-            if playlist_id != '':
-                kwargs['ids'] = playlist_id
-
-            try:
-                api_response = api_instance.get_users_by_userid_items(user_id, parent_id=library_id, recursive=True, fields=extrafields, **kwargs)
-                
-                total_count = api_response.total_record_count
-                if total_count > 0:
-                    items_list = api_response.items
-
-                    # Include only playlist items, and return only a subset of fields
-                    filtered_items = [
-                        {
-                            'name': item.name if item.name else "",
-                            'overview': item.overview if item.overview else "",
-                            'genres': item.genres if item.genres else [],
-                            'date_created': item.date_created.isoformat() if item.date_created else "",
-                            'run_time_ticks' : item.run_time_ticks if item.run_time_ticks else 0,
-                            'run_time': '', # Placeholder
-                            'user_access': [], # Placeholder
-                            'can_share': False, # Placeholder
-                            'media_type': item.type if item.type else "",
-                            'playlist_id': item.id if item.id else ""
-                        }
-                        for item in items_list
-                        if item.type is not None and item.type.lower() == 'playlist'
-                    ]
-
-                    playlist_items = []
-                    api_instance = emby_client.UserServiceApi(e_api_client)
-                    for item in filtered_items:
-                        # convert run_time_ticks to hh:mm:ss
-                        item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
-                        playlist_items.append(item)
-                        
-                        # Determine user access level for this playlist.
-                        filtered_access = []
-                        can_share = False
-                        try:
-                            access_response = api_instance.get_users_itemaccess(item_id=item['playlist_id'])
-                            if access_response.total_record_count > 0:
-                                access_user_list = access_response.items
-                                filtered_access = [
-                                    {
-                                        'user_name': a_user.name if a_user.name else "",
-                                        'user_id': a_user.id if a_user.id else "",
-                                        'access_level': a_user.user_item_share_level if a_user.user_item_share_level else ""
-                                    }
-                                    for a_user in access_user_list
-                                ]
-                                # Determine what we can do with this playlist
-                                can_share = False
-                                for a_user in filtered_access:
-                                    if a_user['user_id'] == user_id:
-                                        if a_user['access_level'] in ['Manage', 'ManageDelete']:
-                                            can_share = True
-                        except ApiException:
-                            # ignore errors while getting user access levels - often they are because we do not own the playlist.
-                            pass
-
-                        item['user_access'] = filtered_access
-                        item['can_share'] = can_share
-             
-                else:
-                    playlist_items = []
-                return {
-                    'success': True,
-                    'playlists': playlist_items
-                }
-            except ApiException as e:
-                return {
-                    'success': False,
-                    'error': str(e)
-                }
-        else:
-            return {
-                'success': False,
-                'error': 'No playlist libraries are available.'
-            }
-    else:
+    if available_libraries is None or len(available_libraries) == 0:
         return {
-            'success': False,
-            'error': 'No libraries are available.'
+            "success": False,
+            "error": "No libraries are available.",
         }
+
+    library_id = _find_playlist_library_id(available_libraries)
+    if library_id == "":
+        return {
+            "success": False,
+            "error": "No playlist libraries are available.",
+        }
+
+    query: dict[str, Any] = {}
+    if playlist_id != "":
+        query["ids"] = playlist_id
+
+    items_api = emby_client.ItemsServiceApi(e_api_client)
+    try:
+        response = items_api.get_users_by_userid_items(
+            user_id,
+            parent_id=library_id,
+            recursive=True,
+            fields=_PLAYLIST_LIBRARY_FIELDS,
+            **query,
+        )
+
+        if response.total_record_count <= 0:
+            return {"success": True, "playlists": []}
+
+        playlist_items = [
+            _serialize_playlist(item)
+            for item in response.items
+            if item.type is not None and item.type.lower() == "playlist"
+        ]
+
+        user_api = emby_client.UserServiceApi(e_api_client)
+        for item in playlist_items:
+            access, can_share = _get_playlist_access(
+                user_api,
+                item["playlist_id"],
+                user_id,
+            )
+            item["user_access"] = access
+            item["can_share"] = can_share
+
+        return {"success": True, "playlists": playlist_items}
+
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def get_playlist_items(e_api_client: object, user_id: str, playlist_id: str) ->dict:
+def get_playlist_items(
+    e_api_client: object,
+    user_id: str,
+    playlist_id: str,
+) -> dict:
 
     """
     Get a list of media items on a playlist from the Emby server.
@@ -722,81 +896,52 @@ def get_playlist_items(e_api_client: object, user_id: str, playlist_id: str) ->d
         error (str): An error message if the request failed, otherwise None.
     """
 
-    # Run query and process results
     api_instance = emby_client.PlaylistServiceApi(e_api_client)
     try:
-        api_response = api_instance.get_playlists_by_id_items(playlist_id, user_id=user_id, fields='Genres,MediaSources,DateCreated,Overview')
+        api_response = api_instance.get_playlists_by_id_items(
+            playlist_id,
+            user_id=user_id,
+            fields=_PLAYLIST_FIELDS,
+        )
         total_count = api_response.total_record_count
         if total_count > 0:
-            items_list = api_response.items
-            # Filter out non-audio and non-video items, and return only a subset of fields
             filtered_items = [
-                {
-                    'title': item.name if item.name else "",
-                    'artists': [artist for artist in item.artists] if item.artists else [],
-                    'album': item.album if item.album else "",
-                    'album_id': item.album_id if item.album_id else "",
-                    'album_artist': item.album_artist if item.album_artist else "",
-                    'disk_number': item.parent_index_number if item.parent_index_number else "",
-                    'track_number': item.index_number if item.index_number else "",
-                    'creation_date': item.date_created.isoformat() if item.date_created else "",
-                    'premiere_date': item.premiere_date.isoformat() if item.premiere_date else "",
-                    'production_year': item.production_year if item.production_year else "",
-                    'genres': item.genres if item.genres else [],
-                    'overview': item.overview if item.overview else "",
-                    'lyrics': "",  # Placeholder for lyrics, will be filled later
-                    # Extract 'extradata' from 'media sources' that are text subtitles with title 'lyrics'
-                    'media_sources': [
-                        {
-                            'media_streams': [
-                                {'extradata': stream.extradata if hasattr(stream, 'extradata') else None}
-                                for stream in media_source.media_streams
-                                if stream.is_text_subtitle_stream is not None and stream.is_text_subtitle_stream == True and stream.title is not None and stream.title.lower() == 'lyrics'
-                            ] if media_source.media_streams else []
-                        }
-                        for media_source in item.media_sources
-                    ] if item.media_sources else [],
-                    'media_type': item.media_type if item.media_type else "",
-                    'bitrate': item.bitrate if item.bitrate else "",
-                    'run_time_ticks': item.run_time_ticks if item.run_time_ticks else 0,
-                    'run_time': "",  # Placeholder for run time, will be filled later
-                    'item_id': item.id if item.id else "",
-                    'playlist_item_number': item.playlist_item_id if item.playlist_item_id else "",
-                    'playlist_item_index': "" # Placeholder for playlist item index, will be filled later
-                }
-                for item in items_list
-                if item.media_type is not None and item.media_type.lower() in ('audio', 'video')
+                _serialize_playlist_item(item, index)
+                for index, item in enumerate(
+                    item
+                    for item in api_response.items
+                    if item.media_type is not None
+                    and item.media_type.lower() in ("audio", "video")
+                )
             ]
-
-            # Extract the lyrics string from the 'media sources' object, if available
-            index_counter = 0
-            for item in filtered_items:
-                # update the item 'lyrics' string and remove the now redundant 'media_sources' key
-                item['lyrics'] = _extract_lyrics(item.pop('media_sources', []))
-                item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
-                item['playlist_item_index'] = str(index_counter)
-                index_counter += 1
-
             # Emby counted every item on the playlist, but we only return the playable ones
             total_count = len(filtered_items)
-
         else:
             filtered_items = []
+
         return {
-            'success': True,
-            'total_count': total_count,
-            'items': filtered_items
+            "success": True,
+            "total_count": total_count,
+            "items": filtered_items,
         }
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def new_playlist(e_api_client: object, user_id:str, available_libraries:list, playlist_name: str, **kwargs) ->dict:
+class _NewPlaylistKwargs(TypedDict, total=False):
+    media_type: NotRequired[str]
+    overview: NotRequired[str]
+
+
+def new_playlist(
+    e_api_client: object,
+    user_id: str,
+    available_libraries: list,
+    playlist_name: Optional[str],
+    **kwargs: Unpack[_NewPlaylistKwargs],
+) -> dict:
 
     """
     Creates a new playlist on the Emby server.
@@ -822,14 +967,13 @@ def new_playlist(e_api_client: object, user_id:str, available_libraries:list, pl
             'success': False,
             'error': 'Playlist name cannot be empty.'
         }  
-    playlist_list =  get_playlists(e_api_client, user_id, available_libraries)
-    if playlist_list['success']:
-        playlists = playlist_list['playlists']
-        for playlist in playlists:
-            if playlist['name'].lower() == playlist_name.lower():
+    playlist_list = get_playlists(e_api_client, user_id, available_libraries)
+    if playlist_list["success"]:
+        for playlist in playlist_list["playlists"]:
+            if playlist["name"].lower() == playlist_name.lower():
                 return {
-                    'success': False,
-                    'error': f'Playlist with name "{playlist_name}" already exists.'
+                    "success": False,
+                    "error": f'Playlist with name "{playlist_name}" already exists.',
                 }
 
     # Process kwargs
@@ -859,22 +1003,23 @@ def new_playlist(e_api_client: object, user_id:str, available_libraries:list, pl
             # To add an overview, we need to update the playlist metadata, which means first getting its BaseItemDto object
             if overview != "":
                 try:
-                    playlist_object = emby_client.UserLibraryServiceApi(e_api_client).get_users_by_userid_items_by_id(user_id, playlist_id)
-                except ApiException as e:
-                    return {
-                        'success': False,
-                        'error': str(e)
-                    }
+                    playlist_object = emby_client.UserLibraryServiceApi(
+                        e_api_client
+                    ).get_users_by_userid_items_by_id(user_id, playlist_id)
+                except ApiException as error:
+                    return _api_failure(error)
                 if playlist_object is not None:
                     playlist_object.overview = overview
                     try:
                         # Update the playlist metadata with the new overview
-                        api_response = emby_client.ItemUpdateServiceApi(e_api_client).post_items_by_itemid(body=playlist_object, item_id=playlist_id)
-                    except ApiException as e:
-                        return {
-                            'success': False,
-                            'error': str(e)
-                        }
+                        emby_client.ItemUpdateServiceApi(
+                            e_api_client
+                        ).post_items_by_itemid(
+                            body=playlist_object,
+                            item_id=playlist_id,
+                        )
+                    except ApiException as error:
+                        return _api_failure(error)
     
             return {
                 'success': True,
@@ -886,15 +1031,23 @@ def new_playlist(e_api_client: object, user_id:str, available_libraries:list, pl
                 'error': 'Failed to create playlist.'
             }
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def set_playlist_meta(e_api_client: object, user_id:str, available_libraries:list, playlist_id: str, **kwargs) ->dict:
+class _PlaylistMetadataKwargs(TypedDict, total=False):
+    name: NotRequired[str]
+    overview: NotRequired[str]
+
+
+def set_playlist_meta(
+    e_api_client: object,
+    user_id: str,
+    available_libraries: list,
+    playlist_id: str,
+    **kwargs: Unpack[_PlaylistMetadataKwargs],
+) -> dict:
 
     """
     Modifies metadata for an existing playlist on the Emby server.
@@ -936,7 +1089,7 @@ def set_playlist_meta(e_api_client: object, user_id:str, available_libraries:lis
 
     # check that the playlist name does not already exist
     if name != "":
-        playlist_list =  get_playlists(e_api_client, user_id, available_libraries)
+        playlist_list = get_playlists(e_api_client, user_id, available_libraries)
         if playlist_list['success']:
             playlists = playlist_list['playlists']
             for playlist in playlists:
@@ -950,17 +1103,13 @@ def set_playlist_meta(e_api_client: object, user_id:str, available_libraries:lis
                             'error': f'Playlist with name "{name}" already exists.'
                         }
 
-    # Run query and process results
-    api_instance = emby_client.PlaylistServiceApi(e_api_client)
-
     # To change the playlist metadata we first need to get its BaseItemDto object
     try:
-        playlist_object = emby_client.UserLibraryServiceApi(e_api_client).get_users_by_userid_items_by_id(user_id, playlist_id)
-    except ApiException as e:
-        return {
-        'success': False,
-        'error': str(e)
-        }
+        playlist_object = emby_client.UserLibraryServiceApi(
+            e_api_client
+        ).get_users_by_userid_items_by_id(user_id, playlist_id)
+    except ApiException as error:
+        return _api_failure(error)
 
     if playlist_object is not None:
         if name != "":
@@ -969,15 +1118,15 @@ def set_playlist_meta(e_api_client: object, user_id:str, available_libraries:lis
             playlist_object.overview = overview
         try:
         # Update the playlist metadata with the new overview
-            api_response = emby_client.ItemUpdateServiceApi(e_api_client).post_items_by_itemid(body=playlist_object, item_id=playlist_id)
+            emby_client.ItemUpdateServiceApi(e_api_client).post_items_by_itemid(
+                body=playlist_object,
+                item_id=playlist_id,
+            )
             return {
                 'success': True
             }
-        except ApiException as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
+        except ApiException as error:
+            return _api_failure(error)
     else:
         return {
             'success': False,
@@ -986,7 +1135,12 @@ def set_playlist_meta(e_api_client: object, user_id:str, available_libraries:lis
 
 #--------------------------------------------------
 
-def add_playlist_items(e_api_client: object, user_id: str, playlist_id: str, item_ids: str) ->dict:
+def add_playlist_items(
+    e_api_client: object,
+    user_id: str,
+    playlist_id: str,
+    item_ids: str,
+) -> dict:
 
     """
     Adds one or more items to the end of an existing playlist on the Emby server.
@@ -1012,21 +1166,21 @@ def add_playlist_items(e_api_client: object, user_id: str, playlist_id: str, ite
                 'success': True,
                 'item_count': api_response.item_added_count
             }
-        else:
-            return {
-                'success': False,
-                'error': 'Failed to add item(s) to playlist.'
-            }
-
-    except ApiException as e:
         return {
             'success': False,
-            'error': str(e)
+            'error': 'Failed to add item(s) to playlist.'
         }
+
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def delete_playlist_items(e_api_client: object, playlist_id: str, playlist_item_number: str) ->dict:
+def delete_playlist_items(
+    e_api_client: object,
+    playlist_id: str,
+    playlist_item_number: str,
+) -> dict:
 
     """
     Removes one or more items from the end of an existing playlist on the Emby server.
@@ -1045,20 +1199,23 @@ def delete_playlist_items(e_api_client: object, playlist_id: str, playlist_item_
     # Run query and process results
     api_instance = emby_client.PlaylistServiceApi(e_api_client)
     try:
-        api_response = api_instance.post_playlists_by_id_items_delete(playlist_id, playlist_item_number)
-        return {
-            'success': True
-        }
+        api_instance.post_playlists_by_id_items_delete(
+            playlist_id,
+            playlist_item_number,
+        )
+        return {"success": True}
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def move_playlist_items(e_api_client: object, playlist_id: str, playlist_item_number: str, playlist_item_index: str) ->dict:
+def move_playlist_items(
+    e_api_client: object,
+    playlist_id: str,
+    playlist_item_number: str,
+    playlist_item_index: str,
+) -> dict:
 
     """
     Moves one item within an existing playlist on the Emby server.
@@ -1078,24 +1235,29 @@ def move_playlist_items(e_api_client: object, playlist_id: str, playlist_item_nu
     # Run query and process results
     api_instance = emby_client.PlaylistServiceApi(e_api_client)
     try:
-        api_response = api_instance.post_playlists_by_id_items_by_itemid_move_by_newindex(playlist_item_number, playlist_id, playlist_item_index)
-        return {
-            'success': True
-        }
+        api_instance.post_playlists_by_id_items_by_itemid_move_by_newindex(
+            playlist_item_number,
+            playlist_id,
+            playlist_item_index,
+        )
+        return {"success": True}
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
 class sharing_kwargs(TypedDict, total=False):
-    user_ids: NotRequired[list]
+    user_ids: NotRequired[list[str] | str]
     item_access: NotRequired[str]
 
-def set_playlist_sharing(e_api_client: object, playlist_id: str, share_type: str, **kwargs: Unpack[sharing_kwargs]) ->dict:
+
+def set_playlist_sharing(
+    e_api_client: object,
+    playlist_id: str,
+    share_type: str,
+    **kwargs: Unpack[sharing_kwargs],
+) -> dict:
 
     """
     Changes the sharing settings of an existing playlist on the Emby server.
@@ -1112,68 +1274,70 @@ def set_playlist_sharing(e_api_client: object, playlist_id: str, share_type: str
         error (str): An error message if the request failed, otherwise None.
     """
 
-    # Run query and process results
     api_instance = emby_client.UserLibraryServiceApi(e_api_client)
 
     try:
-        if share_type.lower() == 'public':
-            api_response = api_instance.post_items_by_id_makepublic(playlist_id)
+        normalized_share_type = share_type.lower()
+        if normalized_share_type == "public":
+            api_instance.post_items_by_id_makepublic(playlist_id)
+            return {"success": True}
+        if normalized_share_type == "private":
+            api_instance.post_items_by_id_makeprivate(playlist_id)
+            return {"success": True}
+        if normalized_share_type != "shared":
             return {
-                'success': True
+                "success": False,
+                "error": (
+                    f"Invalid share_type: {share_type}. "
+                    "Must be one of: Public, Private, Shared."
+                ),
             }
-        elif share_type.lower() == 'private':
-            api_response = api_instance.post_items_by_id_makeprivate(playlist_id)
-            return {
-                'success': True
-            }
-        elif share_type.lower() == 'shared':
-            # Process kwargs
-            user_ids = ''
-            item_access = ''
-            for key in kwargs:
-                match key:
-                    case "user_ids":
-                        if kwargs[key] is not None and kwargs[key] != "":
-                            user_ids = kwargs[key]
-                    case "item_access":
-                        if kwargs[key] is not None and kwargs[key] != "":
-                            item_access = kwargs[key]
-            if user_ids == '' or item_access == '':
-                return {
-                    'success': False,
-                    'error': f"Share_type {share_type} requires parameters 'user_ids' and 'item_access'"
-                }
 
-            # Generate body and call API
-            body = emby_client.UserLibraryUpdateUserItemAccess(
-                item_ids=[playlist_id],
-                user_ids=user_ids if isinstance(user_ids, list) else [uid.strip() for uid in str(user_ids).split(',') if uid.strip()],
-                item_access=item_access
-            )
-            api_response = api_instance.post_items_access(body)
+        user_ids = kwargs.get("user_ids", "")
+        item_access = kwargs.get("item_access", "")
+        user_ids = "" if user_ids is None else user_ids
+        item_access = "" if item_access is None else item_access
+        if user_ids == "" or item_access == "":
             return {
-                'success': True
+                "success": False,
+                "error": (
+                    f"Share_type {share_type} requires parameters "
+                    "'user_ids' and 'item_access'"
+                ),
             }
-        else:
-            return {
-                'success': False,
-                'error': f"Invalid share_type: {share_type}. Must be one of: Public, Private, Shared."
-            }
-        
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
 
-#--------------------------------------------------
+        normalized_user_ids = (
+            user_ids
+            if isinstance(user_ids, list)
+            else [
+                user_id.strip()
+                for user_id in str(user_ids).split(",")
+                if user_id.strip()
+            ]
+        )
+        body = emby_client.UserLibraryUpdateUserItemAccess(
+            item_ids=[playlist_id],
+            user_ids=normalized_user_ids,
+            item_access=item_access,
+        )
+        api_instance.post_items_access(body)
+        return {"success": True}
+
+    except ApiException as error:
+        return _api_failure(error)
+
+
+# --------------------------------------------------
 
 class getusers_kwargs(TypedDict, total=False):
-    user_id: NotRequired[list]
+    user_id: NotRequired[str]
     user_name: NotRequired[str]
 
-def get_users(e_api_client: object, **kwargs: Unpack[getusers_kwargs]) ->dict:
 
+def get_users(
+    e_api_client: object,
+    **kwargs: Unpack[getusers_kwargs],
+) -> dict:
     """
     Gets a list of users from the Emby server. The optional parameters select a single user to list.
 
@@ -1190,27 +1354,19 @@ def get_users(e_api_client: object, **kwargs: Unpack[getusers_kwargs]) ->dict:
         error (str): An error message if the request failed, otherwise None.
     """
 
-    # Process kwargs
-    user_id = ''
-    user_name = ''
-    user_list = []
-    return_list = []
-    for key in kwargs:
-        match key:
-            case "user_id":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    user_id = kwargs[key]
-            case "user_name":
-                if kwargs[key] is not None and kwargs[key] != "":
-                    user_name = kwargs[key]
+    user_id = kwargs.get("user_id")
+    user_name = kwargs.get("user_name")
+    if user_id is None or user_id == "":
+        user_id = ""
+    if user_name is None or user_name == "":
+        user_name = ""
 
     # Run query and process results
     api_instance = emby_client.UserServiceApi(e_api_client)
     try:
-        if user_id != '':
+        if user_id != "":
             # This is more efficient for a single user_id lookup
-            api_response = api_instance.get_users_by_id(user_id)
-            user_list = [api_response]
+            user_list = [api_instance.get_users_by_id(user_id)]
         else:
             # /Users/Query is the authenticated listing and returns every user on the server.
             # /Users/Public only returns the accounts that opted in to the login screen, which
@@ -1218,47 +1374,43 @@ def get_users(e_api_client: object, **kwargs: Unpack[getusers_kwargs]) ->dict:
             # user IDs to work from. Query needs administrator rights, so fall back to Public
             # when it is refused rather than failing outright.
             try:
-                api_response = api_instance.get_users_query()
-                user_list = getattr(api_response, 'items', api_response)
+                response = api_instance.get_users_query()
+                user_list = getattr(response, "items", response)
             except ApiException:
                 user_list = api_instance.get_users_public()
 
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
-    if len(user_list) > 0:
-        # Filter by user_name, if supplied.
-        if user_name != '':
-            wanted_name = unidecode(user_name.casefold())
-            for user in user_list:
-                if user.name is not None and unidecode(user.name.casefold()) == wanted_name:
-                    return_list.append(user)
-        else:
-            return_list = user_list
-
-        # Return a subset of fields as a dictionary of strings instead of a custom object
-        filtered_items = [
-            {
-                'user_name': user.name if user.name else "",
-                'user_id': user.id if user.id else ""
-            }
-            for user in return_list
+    if user_name != "":
+        wanted_name = unidecode(user_name.casefold())
+        user_list = [
+            user
+            for user in user_list
+            if user.name is not None
+            and unidecode(user.name.casefold()) == wanted_name
         ]
-        return_list = filtered_items
 
     return {
-        'success': True,
-        'users': return_list
+        "success": True,
+        "users": [
+            {
+                "user_name": user.name if user.name else "",
+                "user_id": user.id if user.id else "",
+            }
+            for user in user_list
+        ],
     }
 
 #--------------------------------------------------
 # Player Functions
 #-------------------------
 
-def get_player_sessions(e_api_client:object, user_id: Optional[str] = "", media_type: Optional[str] = "") -> dict:
+def get_player_sessions(
+    e_api_client: object,
+    user_id: Optional[str] = "",
+    media_type: Optional[str] = "",
+) -> dict:
     """
     Get a list of active sessions from the Emby server that are media players which we can control.
     
@@ -1292,90 +1444,36 @@ def get_player_sessions(e_api_client:object, user_id: Optional[str] = "", media_
         error (str): An error message if the request failed, otherwise None.
     """
     
-    api_instance = emby_client.SessionsServiceApi(e_api_client)
+    sessions_api = emby_client.SessionsServiceApi(e_api_client)
     try:
-        if user_id == "":
-            api_response = api_instance.get_sessions()
-        else:
-            api_response = api_instance.get_sessions(controllable_by_user_id=user_id)
-        # Filter out sessions that do not have any playable media types, and return a subset of fields
-        session_list = api_response
+        sessions = _fetch_sessions(sessions_api, user_id)
         filtered_items = [
-            {
-                'client_name': session.client,
-                'session_id': session.id,
-                'device_id': session.device_id,
-                'device_name': session.device_name,
-                'device_ip_address': session.remote_end_point,
-                'local_to_media_server': False,
-                'media_types': session.playable_media_types if session.playable_media_types is not None else [],
-                'now_playing_item' : session.now_playing_item if session.now_playing_item is not None else None,
-                'play_state' : session.play_state if session.play_state is not None else None
-            }
-            for session in session_list
-            if session.playable_media_types is not None and session.playable_media_types != []
+            _serialize_player_session(session)
+            for session in sessions
+            if session.playable_media_types is not None
+            and session.playable_media_types != []
         ]
- 
-        # Extract some info from the now_playing_item and play_state objects, if available
-        for item in filtered_items:
-            if item['now_playing_item']:
-                now_playing_item = item['now_playing_item']
-                item['now_playing_title'] = now_playing_item.name
-                item['now_playing_artists'] = now_playing_item.artists
-                item['now_playing_album'] = now_playing_item.album
-                item['now_playing_track_number'] = now_playing_item.index_number
-                item['now_playing_disk_number'] = now_playing_item.parent_index_number
-                item['now_playing_item_id'] = now_playing_item.id
-                # Some items (eg live streams) have no known duration
-                if now_playing_item.run_time_ticks:
-                    item['now_playing_total_milliseconds'] = int(now_playing_item.run_time_ticks / 10000) # convert from ticks
-                    item['now_playing_total_time'] = _ticks_to_hhmmss(now_playing_item.run_time_ticks)
-                else:
-                    item['now_playing_total_milliseconds'] = None
-                    item['now_playing_total_time'] = ""
-                item.pop('now_playing_item', None)
-            if item['play_state']:
-                play_state = item['play_state']
-                if play_state.position_ticks is not None:
-                    item['now_playing_position_milliseconds'] = int(play_state.position_ticks / 10000) # convert from ticks
-                    # a position of zero is meaningful (start of item), so report it as a time rather than blank
-                    item['now_playing_position_time'] = _ticks_to_hhmmss(play_state.position_ticks) or "00:00:00"
-                else:
-                    item['now_playing_position_milliseconds'] = None
-                    item['now_playing_position_time'] = ""
-                item['now_playing_is_paused'] = play_state.is_paused
-                item.pop('play_state', None)
-
-        # If media_type is specified, return only sessions that can actually play this media_type
-        # Also update the 'device_local_to_emby' field to True if the device IP is localhost relative to the Emby server
-        session_list = []
-        for item in filtered_items:
-            if media_type != '':
-                for mt in item['media_types']:
-                    if mt.lower() == media_type.lower():
-                        if item['device_ip_address'] is not None and (item['device_ip_address'] == '::1' or item['device_ip_address'] == '127.0.0.1'):
-                            item['local_to_media_server'] = True
-                        session_list.append(item)
-                        break
-            else:
-                if item['device_ip_address'] is not None and (item['device_ip_address'] == '::1' or item['device_ip_address'] == '127.0.0.1'):
-                    item['local_to_media_server'] = True
-                session_list.append(item)
+        session_list = [
+            item
+            for item in filtered_items
+            if _supports_media_type(item, media_type)
+        ]
 
         return {
             'success': True,
             'sessions': session_list
         }
         
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def full_player_sessions(e_api_client:object, user_id: str = "", media_type: str = "") -> dict:
+def full_player_sessions(
+    e_api_client: object,
+    user_id: str = "",
+    media_type: str = "",
+) -> dict:
     """
     Get a full list of active sessions from the Emby server that are media players which we can control.
     
@@ -1391,40 +1489,29 @@ def full_player_sessions(e_api_client:object, user_id: str = "", media_type: str
         error (str): An error message if the request failed, otherwise None.
     """
     
-    api_instance = emby_client.SessionsServiceApi(e_api_client)
+    sessions_api = emby_client.SessionsServiceApi(e_api_client)
     try:
-        if user_id == "":
-            api_response = api_instance.get_sessions()
-        else:
-            api_response = api_instance.get_sessions(controllable_by_user_id=user_id)
-        # Filter out sessions that do not have any playable media types, and return all fields
-        session_list = api_response
-        filtered_items = [
+        sessions = _fetch_sessions(sessions_api, user_id)
+        session_list = [
             {
                 'session': session,
                 'session_id': session.id
             }
-            for session in session_list
+            for session in sessions
             if session.playable_media_types is not None and session.playable_media_types != []
         ]
-        session_list = []
-        for item in filtered_items:
-            session_list.append(item)
 
         return {
             'success': True,
             'sessions': session_list
         }
         
-    except ApiException as e:
-        return {
-            'success': False,
-            'error': str(e)
-        }
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
 
-def get_playqueue_items(e_api_client: object, session_id: str) ->dict:
+def get_playqueue_items(e_api_client: object, session_id: str) -> dict:
     """
     Get the playqueue for a player session as a list of media item from the Emby server.
     
@@ -1456,62 +1543,24 @@ def get_playqueue_items(e_api_client: object, session_id: str) ->dict:
         error (str): An error message if the request failed, otherwise None.
     """
 
-    api_instance = emby_client.SessionsServiceApi(e_api_client)
-
-    if session_id != '':
-        try:
-            api_response = api_instance.get_sessions_playqueue(id=session_id)
-            total_count = api_response.total_record_count
-            if total_count > 0:
-                items_list = api_response.items
-                filtered_items = [
-                    {
-                        'title': item.name if item.name else "",
-                        'artists': [artist for artist in item.artists] if item.artists else [],
-                        'album': item.album if item.album else "",
-                        'album_id': item.album_id if item.album_id else "",
-                        'album_artist': item.album_artist if item.album_artist else "",
-                        'disk_number': item.parent_index_number if item.parent_index_number else "",
-                        'track_number': item.index_number if item.index_number else "",
-                        'creation_date': item.date_created.isoformat() if item.date_created else "",
-                        'premiere_date': item.premiere_date.isoformat() if item.premiere_date else "",
-                        'production_year': item.production_year if item.production_year else "",
-                        'genres': item.genres if item.genres else [],
-                        'overview': item.overview if item.overview else "",
-                        'media_type': item.media_type if item.media_type else "",
-                        'bitrate': item.bitrate if item.bitrate else "",
-                        'run_time_ticks': item.run_time_ticks if item.run_time_ticks else 0,
-                        'run_time': "",  # Placeholder for run time, will be filled later
-                        'item_id': item.id if item.id else "",
-                        'playlist_item_id': item.playlist_item_id if item.playlist_item_id else ""
-                    }
-                    for item in items_list
-                ]
-                
-                # Convert run_time_ticks into hh:mm:ss
-                for item in filtered_items:
-                    item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
-
-                return {
-                    'success': True,
-                    'items': filtered_items
-                }
-
-            return {
-                'success': True,
-                'items': []
-            }
-
-        except ApiException as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
-    else:
+    sessions_api = emby_client.SessionsServiceApi(e_api_client)
+    if session_id == "":
         return {
-            'success': False,
-            'error': "The 'session_id' parameter cannot be empty."
+            "success": False,
+            "error": "The 'session_id' parameter cannot be empty.",
         }
+
+    try:
+        response = sessions_api.get_sessions_playqueue(id=session_id)
+        if response.total_record_count <= 0:
+            return {"success": True, "items": []}
+
+        return {
+            "success": True,
+            "items": [_serialize_playqueue_item(item) for item in response.items],
+        }
+    except ApiException as error:
+        return _api_failure(error)
 #--------------------------------------------------
 
 class playcmd_kwargs(TypedDict, total=False):
@@ -1519,7 +1568,12 @@ class playcmd_kwargs(TypedDict, total=False):
     user_id: NotRequired[str]
     time_ms: NotRequired[int]
 
-def send_player_command(e_api_client: object, session_id: str, command: str, **kwargs: Unpack[playcmd_kwargs]) ->dict:
+def send_player_command(
+    e_api_client: object,
+    session_id: str,
+    command: str,
+    **kwargs: Unpack[playcmd_kwargs],
+) -> dict:
     """
     Instruct a session to play a media item from the Emby server.
     
@@ -1538,81 +1592,71 @@ def send_player_command(e_api_client: object, session_id: str, command: str, **k
         error (str): An error message if the request failed, otherwise None.
     """
 
-    api_instance = emby_client.SessionsServiceApi(e_api_client)
+    sessions_api = emby_client.SessionsServiceApi(e_api_client)
 
-    if command == 'PlayNow':
+    if command == "PlayNow":
         # Initiating playback is done via the Emby 'post_sessions_by_id_playing' method and requires an item_id.
-
-        if kwargs.get('item_ids') is not None and kwargs.get('item_ids') != '':
-            body = emby_client.PlayRequest() # PlayRequest | PlayRequest:
-            # Emby expects each id as a separate query value, so split the caller's comma delimited list
-            item_ids = [item_id.strip() for item_id in str(kwargs['item_ids']).split(',') if item_id.strip()]
-            play_command = command # str | The type of play command to issue (PlayNow, PlayNext, PlayLast).
-            id = session_id # str | Session Id
-            try:
-                api_response = api_instance.post_sessions_by_id_playing(body, item_ids, play_command, id)
-                return {
-                    'success': True,
-                    'response': api_response
-                }
-                
-            except ApiException as e:
-                return {
-                    'success': False,
-                    'error': str(e)
-                }
-        else:
+        item_ids_value = kwargs.get("item_ids")
+        if item_ids_value is None or item_ids_value == "":
             return {
-                'success': False,
-                'error': "The 'item_ids' parameter is required for the 'PlayNow' command."
+                "success": False,
+                "error": (
+                    "The 'item_ids' parameter is required for the 'PlayNow' command."
+                ),
             }
 
-    elif command in ['Stop', 'Pause', 'Unpause', 'NextTrack', 'PreviousTrack', 'Seek', 'Rewind', 'FastForward', 'PlayPause', 'SeekRelative']:
-        # For all other valid commands, the Emby 'post_sessions_by_id_playing_by_command' method is used.
+        body = emby_client.PlayRequest()
+        item_ids = [
+            item_id.strip()
+            for item_id in str(item_ids_value).split(",")
+            if item_id.strip()
+        ]
+        try:
+            response = sessions_api.post_sessions_by_id_playing(
+                body,
+                item_ids,
+                command,
+                session_id,
+            )
+            return {"success": True, "response": response}
+        except ApiException as error:
+            return _api_failure(error)
 
-        if kwargs.get('user_id') is not None and kwargs.get('user_id') != "":
-
-            # Apply default times and convert milliseconds into PositionTicks
-            try:
-                time_ms = int(kwargs.get('time_ms') or 0)
-            except (TypeError, ValueError):
-                return {
-                    'success': False,
-                    'error': f"The 'time_ms' parameter must be a whole number of milliseconds, got: {kwargs.get('time_ms')}"
-                }
-            if time_ms == 0 and command in ['Rewind', 'FastForward', 'SeekRelative']:
-                time_ms = 30000 # 30 seconds
-            time_ticks = time_ms * 10000
-
-            # Emby's native Rewind & FastForward do not seem to work on some players, so convert to SeekRelative
-            if command.lower() == "rewind":
-                command = "SeekRelative"
-                time_ticks = -time_ticks
-            elif command.lower() == "fastforward":
-                command = "SeekRelative"
-        
-            try:
-                body = emby_client.PlaystateRequest(command, time_ticks, kwargs['user_id'])
-                api_response = api_instance.post_sessions_by_id_playing_by_command(body, session_id, command)
-                return {
-                    'success': True,
-                }
-                
-            except ApiException as e:
-                return {
-                    'success': False,
-                    'error': str(e)
-                }
-        else:
-            error_str = "No user_id was supplied."
-            return {
-                    'success': False,
-                    'error': error_str
-            }
-    else:
+    if command not in _PLAYSTATE_COMMANDS:
         return {
-            'success': False,
-            'error': f"Unsupported command: {command}. Valid commands are 'PlayNow', 'Stop', 'Pause', 'Unpause', 'NextTrack', 'PreviousTrack', 'Seek', 'Rewind', 'FastForward', 'PlayPause', 'SeekRelative'"
+            "success": False,
+            "error": (
+                f"Unsupported command: {command}. Valid commands are 'PlayNow', "
+                "'Stop', 'Pause', 'Unpause', 'NextTrack', 'PreviousTrack', 'Seek', "
+                "'Rewind', 'FastForward', 'PlayPause', 'SeekRelative'"
+            ),
         }
+
+    user_id = kwargs.get("user_id")
+    if user_id is None or user_id == "":
+        return {"success": False, "error": "No user_id was supplied."}
+
+    try:
+        time_ms = int(kwargs.get("time_ms") or 0)
+    except (TypeError, ValueError):
+        return {
+            "success": False,
+            "error": (
+                "The 'time_ms' parameter must be a whole number of milliseconds, "
+                f"got: {kwargs.get('time_ms')}"
+            ),
+        }
+
+    command, time_ticks = _prepare_playstate_command(command, time_ms)
+    try:
+        body = emby_client.PlaystateRequest(command, time_ticks, user_id)
+        sessions_api.post_sessions_by_id_playing_by_command(
+            body,
+            session_id,
+            command,
+        )
+        return {"success": True}
+    except ApiException as error:
+        return _api_failure(error)
 
 #--------------------------------------------------
