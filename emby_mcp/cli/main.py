@@ -223,18 +223,6 @@ def debug():
 
 
 @app.command()
-def install_hotfixes():
-    """Apply the embyclient SDK hotfix patches to the current environment."""
-    from emby_mcp.install_hotfixes import apply_hotfixs
-
-    try:
-        apply_hotfixs()
-    except RuntimeError as e:
-        print_error(str(e))
-        raise typer.Exit(code=1)
-
-
-@app.command()
 def version():
     """Show version information."""
     typer.echo(f"Emby MCP v{__version__}")

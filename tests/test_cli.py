@@ -258,24 +258,3 @@ class TestDebug:
 
         assert result.exit_code == 1
         assert "boom" in result.output
-
-
-class TestInstallHotfixes:
-    """Tests for the install-hotfixes command."""
-
-    def test_hotfixes_are_applied(self, no_env):
-        with patch("emby_mcp.install_hotfixes.apply_hotfixs") as mock_apply:
-            result = runner.invoke(app, ["install-hotfixes"])
-
-        assert result.exit_code == 0
-        mock_apply.assert_called_once()
-
-    def test_missing_sdk_is_reported(self, no_env):
-        with patch(
-            "emby_mcp.install_hotfixes.apply_hotfixs",
-            side_effect=RuntimeError("Could not locate installed emby_client package."),
-        ):
-            result = runner.invoke(app, ["install-hotfixes"])
-
-        assert result.exit_code == 1
-        assert "Could not locate" in result.output

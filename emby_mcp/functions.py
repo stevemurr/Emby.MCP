@@ -28,6 +28,12 @@ import json
 import uuid
 import emby_client
 from emby_client.rest import ApiException
+from emby_mcp.sdk_patches import apply_sdk_patches
+
+# The published embyclient SDK cannot authenticate or query item access without these
+# corrections. Applying them here covers every entry point, since the server, the CLI and
+# the debug harness all reach Emby through this module.
+apply_sdk_patches()
 
 #--------------------------------------------------
 # Internal Helpers

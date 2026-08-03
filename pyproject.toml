@@ -51,10 +51,6 @@ testpaths = ["tests"]
 [tool.coverage.run]
 source = ["emby_mcp", "emby_mcp_server"]
 omit = [
-    # Vendored copies of embyclient SDK files. These are data, copied verbatim into
-    # site-packages by install_hotfixes, and are never imported by this project.
-    "emby_mcp/configuration.py",
-    "emby_mcp/user_service_api.py",
     # An interactive developer harness, not shipped behaviour. It is imported only when
     # MY_DEBUG is set by hand in emby_mcp_server.py, drives a live Emby server, and selects
     # what to exercise via "if True:" edits, so there is nothing here to assert against.
