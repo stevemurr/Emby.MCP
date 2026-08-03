@@ -81,6 +81,7 @@ welcome to redistribute it under certain conditions; see LICENSE.txt for details
         server_url = os.getenv("EMBY_SERVER_URL")
         username = os.getenv("EMBY_USERNAME")
         password = os.getenv("EMBY_PASSWORD")
+        verify_ssl = str(os.getenv("EMBY_VERIFY_SSL", "True")).strip().lower() in ("true", "1", "yes", "y", "on")
         max_chunk_size = os.getenv("LLM_MAX_ITEMS")
         if server_url == None or username == None or password == None:
             print("Fatal error, missing required variables. Ensure the .env file contains EMBY_SERVER_URL, EMBY_USERNAME, EMBY_PASSWORD", file=sys.stderr)
@@ -92,7 +93,7 @@ welcome to redistribute it under certain conditions; see LICENSE.txt for details
     # Login to Emby server
     device_name = MY_HOSTNAME + " (" + MY_PLATFORM + ")"  # shown in Emby server logs & devices page
     client_name = f"{MY_NAME}"  # shown in Emby server logs & devices page
-    result = authenticate_with_emby(server_url, username, password, client_name, MY_VERSION, device_name)
+    result = authenticate_with_emby(server_url, username, password, client_name, MY_VERSION, device_name, verify_ssl)
     if result['success']:
         e_api_client = result['api_client']
         MY_USER_ID = result['user_id'] # we need this for various other Emby function calls
@@ -376,7 +377,7 @@ welcome to redistribute it under certain conditions; see LICENSE.txt for details
                             print(f"Enter access level for these users (One of 'None', 'Read', 'Write', 'Manage', 'ManageDelete') [{default_access_level}] : ", end='', file=sys.stderr)
                             user_input_item_share_access = input('')
                             if user_input_item_share_access == '':
-                               user_input_item_share_access = default_user_ids
+                               user_input_item_share_access = default_access_level
                             if user_input_item_share_access == '.':
                                 loop_playlist = False
                             if loop_playlist:
@@ -521,7 +522,7 @@ welcome to redistribute it under certain conditions; see LICENSE.txt for details
         print("Logout from media server was successful", file=sys.stderr)
         sys.exit(0)
     else:
-        print(f"ERROR: logout from media server failed: {result['error']}", file=sys.stderr)
+        print(f"ERROR: logout from media server failed: {logout_result['error']}", file=sys.stderr)
         sys.exit(2)
 
 #--------------------------------------------------

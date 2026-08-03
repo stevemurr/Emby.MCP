@@ -30,7 +30,50 @@ import emby_client
 from emby_client.rest import ApiException
 
 #--------------------------------------------------
-# Login & Logout Functions 
+# Internal Helpers
+#-------------------------
+
+def _ticks_to_hhmmss(run_time_ticks: Optional[int]) ->str:
+    """
+    Convert an Emby duration in ticks (100 nanoseconds) into a hh:mm:ss string.
+
+    Args:
+        run_time_ticks (int, optional): The duration in ticks, or None.
+
+    Returns:
+        str: The duration as hh:mm:ss, or an empty string if there is no usable duration.
+    """
+
+    if not run_time_ticks or run_time_ticks <= 0:
+        return ""
+    total_seconds = int(run_time_ticks / 10000000) # convert from ticks
+    tthours = total_seconds // 3600
+    ttmins = (total_seconds % 3600) // 60
+    ttsecs = total_seconds % 60
+    return f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
+
+#--------------------------------------------------
+
+def _extract_lyrics(media_sources: list) ->str:
+    """
+    Pull the lyrics text out of the reduced 'media_sources' structure built by the item functions.
+    Emby stores lyrics as the 'extradata' of a text subtitle stream titled 'lyrics'.
+
+    Args:
+        media_sources (list of dict): The reduced media sources of a single item.
+
+    Returns:
+        str: The lyrics text, or an empty string if the item has none.
+    """
+
+    for media_source in media_sources or []:
+        for stream in media_source.get('media_streams', []):
+            if stream.get('extradata'):
+                return stream['extradata']
+    return ""
+
+#--------------------------------------------------
+# Login & Logout Functions
 #-------------------------
 
 def authenticate_with_emby(server_url: str, username: str, password: str, client_name: str = "EmbyPythonClient", client_version: str ="1.0", device_name: str ="EmbyPythonDevice", verify_ssl: Optional[bool] = True) ->dict:
@@ -113,21 +156,23 @@ def authenticate_with_emby(server_url: str, username: str, password: str, client
 
 #--------------------------------------------------
 
-def create_authenticated_client(server_url: str, access_token: str) ->object:
+def create_authenticated_client(server_url: str, access_token: str, verify_ssl: Optional[bool] = True) ->object:
     """
     Create an authenticated API client using an existing access token
-    
+
     Args:
         server_url (str): The Emby server URL
         access_token (str): Previously obtained access token
-        
+        verify_ssl (bool, optional): Whether to verify SSL certificates. Defaults to True.
+
     Returns:
         api_client (obj): Configured API client for further requests
     """
 
     config = emby_client.Configuration()
     config.host = server_url
-    
+    config.verify_ssl = True if verify_ssl is None else verify_ssl
+
     e_api_client = emby_client.ApiClient(configuration=config)
     e_api_client.configuration.api_key['access_token'] = access_token
 
@@ -384,22 +429,26 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
                     lyrics_search = kwargs[key]
             case "first_date":
                 if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["MinStartDate"] = kwargs[key]
+                    kwcooked["min_start_date"] = kwargs[key]
             case "last_date":
                 if kwargs[key] is not None and kwargs[key] != "":
-                    kwcooked["MaxEndDate"] = kwargs[key]
+                    kwcooked["max_end_date"] = kwargs[key]
             case "is_unplayed":
-                if filters != "":
-                    filters = f"{filters},"
-                filters = f"{filters}IsUnplayed"
+                # Only apply the filter when the caller actually asked for it
+                if kwargs[key]:
+                    if filters != "":
+                        filters = f"{filters},"
+                    filters = f"{filters}IsUnplayed"
             case "is_played":
-                if filters != "":
-                    filters = f"{filters},"
-                filters = f"{filters}IsPlayed"        
+                if kwargs[key]:
+                    if filters != "":
+                        filters = f"{filters},"
+                    filters = f"{filters}IsPlayed"
             case "is_favorite":
-                if filters != "":
-                    filters = f"{filters},"
-                filters = f"{filters}IsFavorite"
+                if kwargs[key]:
+                    if filters != "":
+                        filters = f"{filters},"
+                    filters = f"{filters}IsFavorite"
             case _:
                 if kwargs[key] is not None and kwargs[key] != "":
                     kwcooked[key] = kwargs[key]
@@ -411,11 +460,24 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
     extrafields='Genres,MediaSources,DateCreated,Overview,ProductionYear,PremiereDate,Path'
     media_types = 'Audio,Video' # Only return these media types
 
+    # Emby returns HTTP 500 (a SQLite exception) whenever the Genres filter is combined with
+    # MediaTypes, for every library and every MediaTypes value, which would make every genre
+    # search fail. Genres on its own works, so drop MediaTypes for those queries and apply the
+    # same restriction below instead. Emby then also returns containers (series, seasons,
+    # box sets, folders) which have no media_type, and those are dropped by the same filter.
+    filter_media_types_locally = "genres" in kwcooked
+    if not filter_media_types_locally:
+        kwcooked["media_types"] = media_types
+
     try:
-        api_response = api_instance.get_users_by_userid_items(user_id, parent_id=library_id, media_types=media_types, recursive=True, fields=extrafields, **kwcooked)
+        api_response = api_instance.get_users_by_userid_items(user_id, parent_id=library_id, recursive=True, fields=extrafields, **kwcooked)
         total_count = api_response.total_record_count
         if total_count > 0:
             items_list = api_response.items
+            if filter_media_types_locally:
+                wanted_media_types = media_types.split(",")
+                items_list = [item for item in items_list if item.media_type in wanted_media_types]
+                total_count = len(items_list)
             # Return only a subset of fields
             filtered_items = [
                 {
@@ -455,26 +517,19 @@ def get_items(e_api_client: object, user_id: str, library_id: str = "", **kwargs
             
             # Extract the lyrics string from the 'media sources' object, if available
             for item in filtered_items:
-                if item['media_sources']:
-                    media_streams = item['media_sources'][0].get('media_streams', [])
-                    if media_streams and 'extradata' in media_streams[0]:
-                        # update the item 'lyrics' string and remove the now redundant 'media_sources' key
-                        item['lyrics'] = media_streams[0]['extradata'] 
-                        item.pop('media_sources', None)
-                if item['run_time_ticks'] > 0:
-                    total_seconds = int(item['run_time_ticks'] / 10000000) # convert from ticks
-                    tthours = total_seconds // 3600
-                    ttmins = (total_seconds % 3600) // 60
-                    ttsecs = total_seconds % 60
-                    item['run_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
-                item.pop('run_time_ticks', None)
-  
+                # update the item 'lyrics' string and remove the now redundant 'media_sources' key
+                item['lyrics'] = _extract_lyrics(item.pop('media_sources', []))
+                item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
+
             # Perform lyric searching by matching against the lyric or overview fields of each item returned by Emby, after convertion to lower case ASCII
             if lyrics_search != "":
+                needle = unidecode(lyrics_search.casefold())
                 filtered_items = [
                     item for item in filtered_items
-                    if (item['lyrics'] is not None and unidecode(lyrics_search.casefold()) in unidecode(item['lyrics'].casefold())) or (item['overview'] is not None and unidecode(lyrics_search.casefold()) in unidecode(item['overview'].casefold()))
+                    if needle in unidecode(item['lyrics'].casefold()) or needle in unidecode(item['overview'].casefold())
                 ]
+                # Emby counted the items before we filtered them, so report the count we are actually returning
+                total_count = len(filtered_items)
 
         else:
             filtered_items = []
@@ -566,25 +621,18 @@ def get_playlists(e_api_client: object, user_id: str, available_libraries:list, 
 
                     playlist_items = []
                     api_instance = emby_client.UserServiceApi(e_api_client)
-                    for item in filtered_items:    
+                    for item in filtered_items:
                         # convert run_time_ticks to hh:mm:ss
-                        if item['run_time_ticks'] > 0:
-                            total_seconds = int(item['run_time_ticks'] / 10000000) # convert from ticks
-                            tthours = total_seconds // 3600
-                            ttmins = (total_seconds % 3600) // 60
-                            ttsecs = total_seconds % 60
-                            item['run_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
-                        item.pop('run_time_ticks', None)
+                        item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
                         playlist_items.append(item)
                         
                         # Determine user access level for this playlist.
                         filtered_access = []
                         can_share = False
                         try:
-                            api_response = api_instance.get_users_itemaccess(item_id=item['playlist_id'])
-                            total_count = api_response.total_record_count
-                            if total_count > 0:
-                                access_user_list = api_response.items
+                            access_response = api_instance.get_users_itemaccess(item_id=item['playlist_id'])
+                            if access_response.total_record_count > 0:
+                                access_user_list = access_response.items
                                 filtered_access = [
                                     {
                                         'user_name': a_user.name if a_user.name else "",
@@ -599,9 +647,9 @@ def get_playlists(e_api_client: object, user_id: str, available_libraries:list, 
                                     if a_user['user_id'] == user_id:
                                         if a_user['access_level'] in ['Manage', 'ManageDelete']:
                                             can_share = True
-                        except ApiException as e:
+                        except ApiException:
                             # ignore errors while getting user access levels - often they are because we do not own the playlist.
-                            do_nothing=True
+                            pass
 
                         item['user_access'] = filtered_access
                         item['can_share'] = can_share
@@ -658,11 +706,12 @@ def get_playlist_items(e_api_client: object, user_id: str, playlist_id: str) ->d
             overview (str): the short description of the item.
             lyrics (str): the lyrics for, or long description of, the item
             media_type (str): the item type, either 'Audio' or 'Video'.
-            run_time_ticks (int): the run time of the item in ticks (100 nanoseconds).
+            run_time (str): the run time of the item as hh:mm:ss.
             bitrate (int): the bitrate of the item in bits per second.
             item_id (str): the unique identifier of the item within this Emby server.
             playlist_item_number (str): the unique identifier of the item within this playlist.
             playlist_item_index (str): the position of the item within this playlist.
+        total_count (int): the number of playable items returned.
         success (bool): True if the request was successful, False otherwise.
         error (str): An error message if the request failed, otherwise None.
     """
@@ -670,10 +719,9 @@ def get_playlist_items(e_api_client: object, user_id: str, playlist_id: str) ->d
     # Run query and process results
     api_instance = emby_client.PlaylistServiceApi(e_api_client)
     try:
-        api_response = api_instance.get_playlists_by_id_items(playlist_id, user_id=user_id, fields='Genres,MediaStreams,DateCreated,Overview')
+        api_response = api_instance.get_playlists_by_id_items(playlist_id, user_id=user_id, fields='Genres,MediaSources,DateCreated,Overview')
         total_count = api_response.total_record_count
         if total_count > 0:
-            index_counter = 0
             items_list = api_response.items
             # Filter out non-audio and non-video items, and return only a subset of fields
             filtered_items = [
@@ -705,32 +753,26 @@ def get_playlist_items(e_api_client: object, user_id: str, playlist_id: str) ->d
                     'media_type': item.media_type if item.media_type else "",
                     'bitrate': item.bitrate if item.bitrate else "",
                     'run_time_ticks': item.run_time_ticks if item.run_time_ticks else 0,
+                    'run_time': "",  # Placeholder for run time, will be filled later
                     'item_id': item.id if item.id else "",
                     'playlist_item_number': item.playlist_item_id if item.playlist_item_id else "",
                     'playlist_item_index': "" # Placeholder for playlist item index, will be filled later
                 }
                 for item in items_list
-                if item.media_type.lower() == 'audio' or item.media_type.lower() == 'video'
+                if item.media_type is not None and item.media_type.lower() in ('audio', 'video')
             ]
-            
+
             # Extract the lyrics string from the 'media sources' object, if available
             index_counter = 0
             for item in filtered_items:
-                if item['media_sources']:
-                    media_streams = item['media_sources'][0].get('media_streams', [])
-                    if media_streams and 'extradata' in media_streams[0]:
-                        # update the item 'lyrics' string and remove the now redundant 'media_sources' key
-                        item['lyrics'] = media_streams[0]['extradata'] 
-                        item.pop('media_sources', None)
-                if item['run_time_ticks'] > 0:
-                    total_seconds = int(item['run_time_ticks'] / 10000000) # convert from ticks
-                    tthours = total_seconds // 3600
-                    ttmins = (total_seconds % 3600) // 60
-                    ttsecs = total_seconds % 60
-                    item['run_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
-                item.pop('run_time_ticks', None)
+                # update the item 'lyrics' string and remove the now redundant 'media_sources' key
+                item['lyrics'] = _extract_lyrics(item.pop('media_sources', []))
+                item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
                 item['playlist_item_index'] = str(index_counter)
                 index_counter += 1
+
+            # Emby counted every item on the playlist, but we only return the playable ones
+            total_count = len(filtered_items)
 
         else:
             filtered_items = []
@@ -1097,10 +1139,11 @@ def set_playlist_sharing(e_api_client: object, playlist_id: str, share_type: str
                 }
 
             # Generate body and call API
-            body = emby_client.UserLibraryUpdateUserItemAccess
-            body.item_ids = [playlist_id]
-            body.user_ids = user_ids
-            body.item_access = item_access
+            body = emby_client.UserLibraryUpdateUserItemAccess(
+                item_ids=[playlist_id],
+                user_ids=user_ids if isinstance(user_ids, list) else [uid.strip() for uid in str(user_ids).split(',') if uid.strip()],
+                item_access=item_access
+            )
             api_response = api_instance.post_items_access(body)
             return {
                 'success': True
@@ -1163,7 +1206,16 @@ def get_users(e_api_client: object, **kwargs: Unpack[getusers_kwargs]) ->dict:
             api_response = api_instance.get_users_by_id(user_id)
             user_list = [api_response]
         else:
-            user_list = api_instance.get_users_public()
+            # /Users/Query is the authenticated listing and returns every user on the server.
+            # /Users/Public only returns the accounts that opted in to the login screen, which
+            # on a server that hides them is an empty list, leaving playlist sharing with no
+            # user IDs to work from. Query needs administrator rights, so fall back to Public
+            # when it is refused rather than failing outright.
+            try:
+                api_response = api_instance.get_users_query()
+                user_list = getattr(api_response, 'items', api_response)
+            except ApiException:
+                user_list = api_instance.get_users_public()
 
     except ApiException as e:
         return {
@@ -1174,8 +1226,9 @@ def get_users(e_api_client: object, **kwargs: Unpack[getusers_kwargs]) ->dict:
     if len(user_list) > 0:
         # Filter by user_name, if supplied.
         if user_name != '':
+            wanted_name = unidecode(user_name.casefold())
             for user in user_list:
-                if unidecode(user.name.casefold()) == unidecode(user_name.casefold()):
+                if user.name is not None and unidecode(user.name.casefold()) == wanted_name:
                     return_list.append(user)
         else:
             return_list = user_list
@@ -1267,25 +1320,23 @@ def get_player_sessions(e_api_client:object, user_id: Optional[str] = "", media_
                 item['now_playing_track_number'] = now_playing_item.index_number
                 item['now_playing_disk_number'] = now_playing_item.parent_index_number
                 item['now_playing_item_id'] = now_playing_item.id
-                item['now_playing_total_milliseconds'] = int(now_playing_item.run_time_ticks / 10000) # convert from ticks
-                total_seconds = item['now_playing_total_milliseconds'] // 1000
-                tthours = total_seconds // 3600
-                ttmins = (total_seconds % 3600) // 60
-                ttsecs = total_seconds % 60
-                item['now_playing_total_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
+                # Some items (eg live streams) have no known duration
+                if now_playing_item.run_time_ticks:
+                    item['now_playing_total_milliseconds'] = int(now_playing_item.run_time_ticks / 10000) # convert from ticks
+                    item['now_playing_total_time'] = _ticks_to_hhmmss(now_playing_item.run_time_ticks)
+                else:
+                    item['now_playing_total_milliseconds'] = None
+                    item['now_playing_total_time'] = ""
                 item.pop('now_playing_item', None)
             if item['play_state']:
                 play_state = item['play_state']
                 if play_state.position_ticks is not None:
                     item['now_playing_position_milliseconds'] = int(play_state.position_ticks / 10000) # convert from ticks
-                    total_seconds = item['now_playing_position_milliseconds'] // 1000
-                    tthours = total_seconds // 3600
-                    ttmins = (total_seconds % 3600) // 60
-                    ttsecs = total_seconds % 60
-                    item['now_playing_position_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
+                    # a position of zero is meaningful (start of item), so report it as a time rather than blank
+                    item['now_playing_position_time'] = _ticks_to_hhmmss(play_state.position_ticks) or "00:00:00"
                 else:
                     item['now_playing_position_milliseconds'] = None
-                    item['now_playing_total_time'] = ""
+                    item['now_playing_position_time'] = ""
                 item['now_playing_is_paused'] = play_state.is_paused
                 item.pop('play_state', None)
 
@@ -1433,13 +1484,7 @@ def get_playqueue_items(e_api_client: object, session_id: str) ->dict:
                 
                 # Convert run_time_ticks into hh:mm:ss
                 for item in filtered_items:
-                    if item['run_time_ticks'] > 0:
-                        total_seconds = int(item['run_time_ticks'] / 10000000) # convert from ticks
-                        tthours = total_seconds // 3600
-                        ttmins = (total_seconds % 3600) // 60
-                        ttsecs = total_seconds % 60
-                        item['run_time'] = f"{str(tthours).zfill(2)}:{str(ttmins).zfill(2)}:{str(ttsecs).zfill(2)}"
-                    item.pop('run_time_ticks', None)
+                    item['run_time'] = _ticks_to_hhmmss(item.pop('run_time_ticks', 0))
 
                 return {
                     'success': True,
@@ -1493,8 +1538,9 @@ def send_player_command(e_api_client: object, session_id: str, command: str, **k
         # Initiating playback is done via the Emby 'post_sessions_by_id_playing' method and requires an item_id.
 
         if kwargs.get('item_ids') is not None and kwargs.get('item_ids') != '':
-            body = emby_client.PlayRequest() # PlayRequest | PlayRequest: 
-            item_ids = [kwargs['item_ids']] # list[str] | The ids of the items to play, comma delimited
+            body = emby_client.PlayRequest() # PlayRequest | PlayRequest:
+            # Emby expects each id as a separate query value, so split the caller's comma delimited list
+            item_ids = [item_id.strip() for item_id in str(kwargs['item_ids']).split(',') if item_id.strip()]
             play_command = command # str | The type of play command to issue (PlayNow, PlayNext, PlayLast).
             id = session_id # str | Session Id
             try:
@@ -1521,10 +1567,13 @@ def send_player_command(e_api_client: object, session_id: str, command: str, **k
         if kwargs.get('user_id') is not None and kwargs.get('user_id') != "":
 
             # Apply default times and convert milliseconds into PositionTicks
-            if kwargs.get('time_ms') is None: 
-                time_ms = 0
-            else:
-                time_ms = kwargs.get('time_ms')
+            try:
+                time_ms = int(kwargs.get('time_ms') or 0)
+            except (TypeError, ValueError):
+                return {
+                    'success': False,
+                    'error': f"The 'time_ms' parameter must be a whole number of milliseconds, got: {kwargs.get('time_ms')}"
+                }
             if time_ms == 0 and command in ['Rewind', 'FastForward', 'SeekRelative']:
                 time_ms = 30000 # 30 seconds
             time_ticks = time_ms * 10000

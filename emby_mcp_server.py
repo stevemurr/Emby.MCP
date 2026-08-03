@@ -53,7 +53,7 @@ if MY_DEBUG:
 
 # Some statements about the script
 MY_NAME = "Emby.MCP"
-MY_VERSION = "1.0.2"
+MY_VERSION = __version__  # single source of truth, declared in emby_mcp/__init__.py
 MY_PURPOSE = """These MCP tools allow you to control an Emby media server. Using them you can retrieve
 a list of libraries, genres, playlists, audio & video items, and player sessions. 
 You can add items to playlists and play, pause and stop itens on a player session."""
@@ -65,17 +65,22 @@ welcome to redistribute it under certain conditions; see LICENSE.txt for details
 MY_PLATFORM = get_platform_system()  # Get the platform system name (e.g., 'Linux', 'Windows', 'Darwin')
 MY_HOSTNAME = get_platform_hostname()  # Get the platform hostname (e.g., 'my-computer.local')
 
-# Set UTF-8 encoding. Line buffering ensures immediate input/output on receiving LF or CR.
-sys.stdin = io.TextIOWrapper(sys.stdin.buffer, line_buffering=True, encoding='utf-8')
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, line_buffering=True, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, line_buffering=True, encoding='utf-8')
+def configure_utf8_streams() ->None:
+    """
+    Set UTF-8 encoding on the standard streams used by the MCP stdio transport.
+    Line buffering ensures immediate input/output on receiving LF or CR.
+    Only called when actually serving, so that merely importing this module does not
+    replace the streams of a host process (eg the CLI or a test runner).
 
-# Initialise MCP context variables
-mcp_context = {}
-mcp_context['search_item_chunking'] = {}
+    Args:
+        None
 
-# Create the MCP server
-mcp = FastMCP(name=MY_NAME, instructions=MY_PURPOSE)
+    Returns:
+        None
+    """
+    sys.stdin = io.TextIOWrapper(sys.stdin.buffer, line_buffering=True, encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, line_buffering=True, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, line_buffering=True, encoding='utf-8')
 
 #==================================================
 # Functions for Interacting with MCP Clients
@@ -168,8 +173,8 @@ async def app_lifespan(server: FastMCP) ->AsyncIterator[dict]:
         else:
             print(f"ERROR: logout from media server failed: {logout_result['error']}", file=sys.stderr)
 
-# Pass lifespan to server
-mcp = FastMCP(name=MY_NAME, lifespan=app_lifespan)
+# Create the MCP server, passing it the lifespan manager defined above
+mcp = FastMCP(name=MY_NAME, instructions=MY_PURPOSE, lifespan=app_lifespan)
 
 def str_to_bool(s: str) -> bool:
     """
@@ -182,6 +187,41 @@ def str_to_bool(s: str) -> bool:
         Bool: True if the string is one of "true", "1", "yes", "y", or "on" (case-insensitive), otherwise False.
     """
     return str(s).strip().lower() in ("true", "1", "yes", "y", "on")
+
+DEFAULT_MAX_CHUNK_SIZE = 100
+
+def get_max_chunk_size(auth_context: dict) -> int:
+    """
+    Read the configured maximum number of items to return per chunk from the app context.
+    A missing, non-numeric or non-positive LLM_MAX_ITEMS falls back to the default rather than
+    failing the tool call. Zero or negative would otherwise disable chunking while still
+    reporting a chunk_size of zero alongside a full set of items.
+
+    Args:
+        auth_context (dict): The lifespan context.
+
+    Returns:
+        Int: the maximum number of items per chunk, always greater than zero.
+    """
+    try:
+        chunk_size = int(auth_context.get('max_chunk_size') or DEFAULT_MAX_CHUNK_SIZE)
+    except (TypeError, ValueError):
+        print(
+            f"WARNING: LLM_MAX_ITEMS is not a whole number ({auth_context.get('max_chunk_size')}), "
+            f"using {DEFAULT_MAX_CHUNK_SIZE} instead.",
+            file=sys.stderr,
+        )
+        return DEFAULT_MAX_CHUNK_SIZE
+
+    if chunk_size <= 0:
+        print(
+            f"WARNING: LLM_MAX_ITEMS must be greater than zero ({chunk_size}), "
+            f"using {DEFAULT_MAX_CHUNK_SIZE} instead.",
+            file=sys.stderr,
+        )
+        return DEFAULT_MAX_CHUNK_SIZE
+
+    return chunk_size
 
 #--------------------------------------------------
 # Userlist Tools
@@ -261,7 +301,7 @@ def select_library(library_name: str = "") -> str:
         Str: "Success" or an error message
     """
 
-    if library_name is not None or library_name != "":
+    if library_name is not None and library_name != "":
         ctx = mcp.get_context()
         auth_context = ctx.request_context.lifespan_context
         available_libraries = auth_context['available_libraries']
@@ -302,9 +342,9 @@ def retrieve_current_library() -> str:
     """
     ctx = mcp.get_context()
     auth_context = ctx.request_context.lifespan_context
-    current_library = auth_context['current_library']    
+    current_library = auth_context['current_library']
 
-    if current_library is not None:
+    if current_library:
         return json.dumps(current_library)
     else:
         return "ERROR: no library is currently selected. Select library using tool select_library"
@@ -329,7 +369,7 @@ def retrieve_genre_list() -> str:
     auth_context = ctx.request_context.lifespan_context
     current_library = auth_context['current_library']
 
-    if current_library is not None:
+    if current_library:
         e_api_client = auth_context['api_client']
         genre_list = get_genre_list(e_api_client, library_id=current_library['id'])
         if genre_list['success']:
@@ -398,10 +438,10 @@ def search_for_item(title_or_album: Optional[str] = "",
     auth_context = ctx.request_context.lifespan_context
     current_library = auth_context['current_library']
 
-    if current_library is not None:
+    if current_library:
         e_api_client = auth_context['api_client']
         user_id = auth_context['user_id']
-        max_chunk_size = int(auth_context['max_chunk_size'])
+        max_chunk_size = get_max_chunk_size(auth_context)
 
         kwargs = {}
         if title_or_album is not None and title_or_album != "":
@@ -428,17 +468,16 @@ def search_for_item(title_or_album: Optional[str] = "",
             search_results['chunk_number'] = 0
             search_results['items'] = item_list['items']
 
-            if max_chunk_size is not None and max_chunk_size > 0 and max_chunk_size < total_items:
+            if max_chunk_size > 0 and max_chunk_size < total_items:
                 # more items than can be returned in one go, so save to context and retrieve first chunk
                 search_results['more_chunks_available'] = True # False means this is the last chunk
                 auth_context['search_item_chunking'] = search_results
-                # retrieve and return the first chunk
-                search_results = retrieve_next_search_chunk() 
-            else:
-                # acceptable number of items, so mark as last chunk 
-                search_results['chunk_number'] = 1
-                search_results['more_chunks_available'] = False # False means this is the last chunk
+                # retrieve and return the first chunk (already serialised as JSON)
+                return retrieve_next_search_chunk()
 
+            # acceptable number of items, so mark as last chunk
+            search_results['chunk_number'] = 1
+            search_results['more_chunks_available'] = False # False means this is the last chunk
             return json.dumps(search_results)
 
         else:
@@ -765,7 +804,7 @@ def retrieve_playlist_items(playlist_id: str) -> str:
         overview (str): the short description of the item.
         lyrics (str): the lyrics for, or long description of, the item
         media_type (str): the item type, either 'Audio' or 'Video'.
-        run_time_ticks (int): the run time of the item in ticks (100 nanoseconds).
+        run_time (str): the run time / play length of the item as hh:mm:ss.
         bitrate (int): the bitrate of the item in bits per second.
         item_id (str): the unique identifier of the item within this Emby server.
         playlist_item_number (str): the unique identifier of the item within this playlist.
@@ -925,8 +964,10 @@ def share_playlist_user_access(playlist_id: str, user_ids: str, access_level:str
     auth_context = ctx.request_context.lifespan_context
     e_api_client = auth_context['api_client']
 
-    user_id_list = user_ids.split(",")
-    result = set_playlist_sharing(e_api_client, playlist_id, 'Shared', user_ids=user_id_list, item_access=access_level)
+    # Pass the raw string through: set_playlist_sharing strips whitespace and drops empty
+    # entries, but only for a string. Pre-splitting here would hand it a list it leaves alone,
+    # so "id1, id2" would reach Emby as " id2" and "" would reach it as a single empty user ID.
+    result = set_playlist_sharing(e_api_client, playlist_id, 'Shared', user_ids=user_ids, item_access=access_level)
     if result['success']:
         return f"Successfully shared playlist with other users."
     else:
@@ -1063,7 +1104,7 @@ def control_media_player(session_id: str, command: str, item_ids: Optional[str] 
     """
     Control the media player identified as 'session_id' by sending it a 'command'. 
     Valid commands are: 'PlayNow', 'Stop', 'Pause', 'Unpause', 'NextTrack', 'PreviousTrack', 'Seek', 'Rewind', 'FastForward'.
-    The PlayNow command requires 'item_ids' contain one or more comma separated 'item_id' obtained from the retrieve_item_list_by_genre tool.
+    The PlayNow command requires 'item_ids' contain one or more comma separated 'item_id' obtained from the search_for_item tool.
     Seek, Rewind, FastForward can specify a time in milliseconds. The 'session_id' is obtained from the retrieve_player_list tool.
 
     Args:
@@ -1105,14 +1146,26 @@ def control_media_player(session_id: str, command: str, item_ids: Optional[str] 
 # Only used if script run directly for startup checks or debugging.
 #==================================================
 
-if __name__ == "__main__":
+def main() ->None:
+    """
+    Entry point used when this script is run directly, for startup checks or debugging.
+    Verifies that we can log in and list libraries before starting the MCP stdio server.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
+
+    configure_utf8_streams()
 
     if MY_DEBUG and 'test_emby_functions' in globals() and callable(globals()['test_emby_functions']):
-        # If in debug mode, run interactive Emby functionality tests (see lib_emby_debugging.py)
+        # If in debug mode, run interactive Emby functionality tests (see emby_mcp/debug.py)
         test_emby_functions(MY_NAME, MY_VERSION, MY_PLATFORM, MY_HOSTNAME)
 
     else:
-        # Run some startup checks 
+        # Run some startup checks
         print(f"\n{MY_LICENSE}\n\nRunning startup checks...", file=sys.stderr)
 
         # Load login environment variables from .env file
@@ -1164,12 +1217,21 @@ if __name__ == "__main__":
         mcp.run(transport='stdio')
 
 
-def serve():
-    """Run the MCP server."""
+def serve() ->None:
+    """
+    Run the MCP server over the stdio transport. Used by the emby-mcp CLI.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
+    configure_utf8_streams()
     mcp.run(transport='stdio')
 
 
 if __name__ == "__main__":
-    pass
+    main()
 
 #--------------------------------------------------

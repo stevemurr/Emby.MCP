@@ -17,7 +17,7 @@ class EmbyConfig:
         self.verify_ssl: bool = self._str_to_bool(
             os.getenv("EMBY_VERIFY_SSL", "True")
         )
-        self.max_items: int = int(os.getenv("LLM_MAX_ITEMS", "100"))
+        self.max_items: int = self._str_to_int(os.getenv("LLM_MAX_ITEMS"), 100)
 
     def _load_env(self, env_file: Optional[str] = None) -> None:
         """Load environment variables from .env file."""
@@ -32,6 +32,14 @@ class EmbyConfig:
     def _str_to_bool(value: str) -> bool:
         """Convert string to boolean."""
         return str(value).strip().lower() in ("true", "1", "yes", "y", "on")
+
+    @staticmethod
+    def _str_to_int(value: Optional[str], default: int) -> int:
+        """Convert string to integer, falling back to the default if it is missing or not a number."""
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            return default
 
     @property
     def is_valid(self) -> bool:
