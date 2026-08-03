@@ -1,281 +1,338 @@
 # Emby.MCP
-Model Context Protocol (MCP) server that connects an Emby media server to an AI client such as Claude Desktop, 
-creating a kind of Amazon Alexa (tm) for any MCP compliant LLM using your own media collection. A personal MCP
-and Python learning exercise, inspired into action by hearing Yoko Li talk about her [Morse Code MCP server](https://github.com/ykhli/mcp-light-control).
 
-**Note, this is an independent project with no affiliation to, or endorsement by, [Emby LLC](https://emby.media/).**
+[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](https://github.com/stevemurr/Emby.MCP/releases)
+[![Python](https://img.shields.io/badge/python-3.13%2B-blue.svg)](https://www.python.org/)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-green.svg)](LICENSE.txt)
+[![Tests](https://img.shields.io/badge/tests-301%20passing-brightgreen.svg)](#development)
+[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen.svg)](#development)
+
+A [Model Context Protocol](https://modelcontextprotocol.io/) server that connects an
+[Emby media server](https://emby.media/) to any MCP-compatible AI client, letting you browse, search,
+queue and play your own media collection in natural language.
+
+Ask Claude to *"find the BBC radio dramas with Bill Nighy in the cast and queue them on the living room
+speaker"*, and it will search your library by lyrics metadata, build a playlist, and start playback.
+
+> **Not affiliated with, or endorsed by, [Emby LLC](https://emby.media/).**
 
 ## Contents
-[Features](#features) | [Requirements](#requirements) | [Installation](#installation) | [Usage](#usage) | [Under The Hood](#under-the-hood) | [Also See](#also-see) | [License](#license)
+
+[Features](#features) · [Requirements](#requirements) · [Installation](#installation) ·
+[Configuration](#configuration) · [Connecting an AI client](#connecting-an-ai-client) ·
+[CLI reference](#cli-reference) · [Usage tips](#usage-tips) · [Architecture](#architecture) ·
+[Development](#development) · [Troubleshooting](#troubleshooting) · [Credits](#credits) · [License](#license)
 
 ## Features
-A minimum viable project that allows an LLM to do the following via MCP tools:
-* Log on to & log out of an Emby media server;
-* Retrieve a list of media libraries;
-* Select a specified library;
-* Retrieve a list of genres used in that library;
-* Search for items in that library by genre, item title, album name, release year, and lyrics, chunking the response as needed;
-* Retrieve playlists, create new playlists, add items to playlists & re-order them, and share playlists with other Emby users;
-* Retrieve a list of accessible media players known to Emby;
-* Retrieve the current play queue of a specified media player;
-* Control the playing, pausing, seeking, etc of a specified media player, including transferring the queue to another player.
+
+- **Library browsing** — list libraries and the genres within them, and scope a session to one library.
+- **Rich search** — by title, album, artist, genre, release year, and free text in lyrics or description.
+  Results are returned in size-limited chunks so large libraries do not overwhelm the model's context.
+- **Playlist management** — create, rename, reorder, add and remove items, and share with other Emby
+  users at a chosen access level.
+- **Playback control** — list active player sessions, read their play queues, and play, pause, seek,
+  skip or transfer a queue to another device.
+
+### MCP tools
+
+The server exposes 20 tools. Names and docstrings are written for model comprehension, so the client
+generally picks the right one without being told.
+
+| Area | Tools |
+|---|---|
+| Users | `retrieve_user_list` |
+| Libraries | `retrieve_library_list`, `select_library`, `retrieve_current_library`, `retrieve_genre_list` |
+| Search | `search_for_item`, `retrieve_next_search_chunk` |
+| Playlists | `create_playlist`, `modify_playlist_name`, `retrieve_playlist_list`, `retrieve_playlist_items`, `add_items_to_playlist`, `remove_items_from_playlist`, `reorder_items_on_playlist` |
+| Sharing | `share_playlist_public`, `share_playlist_user_access`, `stop_sharing_playlist` |
+| Players | `retrieve_player_list`, `retrieve_player_queue`, `control_media_player` |
 
 ## Requirements
-* [Python](https://www.python.org/) v3.13 or higher 
-* The [uv](https://docs.astral.sh/uv/) package/project manager
-* The [MCP Server SDK for Python](https://github.com/modelcontextprotocol/python-sdk/) v1.94 or higher
-* The [Emby client SDK](https://pypi.org/project/embyclient/) for Python v4.9.0.33, with hotfix patches (see below).
-* A working [Emby Media Server](https://emby.media/about.html) with a library of media files, either local or accessible via a network.
-* An MCP-compatible LLM/AI client. Emby.MCP was developed using Claude Desktop, however at time of writing more than 60 other clients were listed in the [Feature Support Matrix](https://modelcontextprotocol.io/clients) - pick one that supports **Tools**.
-* An LLM subscription plan that supports MCP (this may require payment).
+
+| | |
+|---|---|
+| Python | 3.13 or newer |
+| Package manager | [uv](https://docs.astral.sh/uv/) |
+| Emby server | A reachable [Emby Media Server](https://emby.media/about.html) with a media library |
+| AI client | Any MCP client with **Tools** support — see the [client matrix](https://modelcontextprotocol.io/clients) |
+
+Python dependencies (`mcp[cli]<2`, `embyclient`, `typer`, `dotenv`, `unidecode`) are installed by `uv sync`.
+
+> `mcp` is pinned below 2.x, which removed the `mcp.server.fastmcp` API this server is built on.
 
 ## Installation
-The following instructions are for a clean installation on Windows 11 Pro - adjust for your own platform and needs.
 
-[Install Python](#install-python) | [Install Emby.MCP](#install-emby.mcp) | [Install Patches](#install-hotfix-patches) | [Login Config](#login-configuration) | [Basic Checks](#basic-checks) | [Configure LLM](#configure-your-llm-mcp-client)
-
-### Install Python
-* Install [latest Python](https://www.python.org/). Customise the install: Optional Features = select all | Advanced Options = install for all, associate files, create shortcuts, add to environment, precompile.
-* From a Powershell terminal, run:
+```bash
+git clone https://github.com/stevemurr/Emby.MCP.git
+cd Emby.MCP
+uv sync
 ```
+
+<details>
+<summary><b>Windows (PowerShell)</b></summary>
+
+```powershell
 pip install uv
-```
-* Add uv to the path via Windows Settings > System > About > Advanced > [control panel opens] > Environment Variables > [double-click on Path in the User section at top] > [window opens] > New. Paste in the following (change "313" to the Python version that was installed above, ignoring the 3rd ".x" part): ```%USERPROFILE%\AppData\Roaming\Python\Python313\Scripts```
-
-### Install Emby.MCP
-* Create empty folder ```\path\to\Emby.MCP``` somewhere on your computer.
-* Download the [Emby.MCP files from GitHub](https://github.com/angeltek/Emby.MCP) into this folder, overwriting any existing files if you are performing an upgrade.
-* Install all dependencies by running the following from a Powershell terminal:
-```
-cd "\path\to\Emby.MCP"
+git clone https://github.com/stevemurr/Emby.MCP.git
+cd Emby.MCP
 uv sync --link-mode=copy
 ```
 
-### Install Hotfix Patches
-At every Python virtual environment sync (like the step above) you will need to patch the Emby client SDK until [these fix on github](https://github.com/angeltek/Emby.SDK/tree/4.9.0.33-Beta-A01) have been incorporated into Emby's official release.
+If `uv` is not found afterwards, add `%USERPROFILE%\AppData\Roaming\Python\Python313\Scripts` to your
+`Path` via Settings → System → About → Advanced system settings → Environment Variables.
+</details>
 
-* From a Powershell terminal, run:
-```
-cd \path\to\Emby.MCP
-copy "hotfixes\emby\configuration.py" ".venv\Lib\site-packages\emby_client"
-copy "hotfixes\emby\user_service_api.py" ".venv\Lib\site-packages\emby_client\api"
+That is the whole installation — there is no patch step.
+
+### About the SDK corrections
+
+The official [`embyclient`](https://pypi.org/project/embyclient/) SDK has two defects that would
+otherwise stop this server working:
+
+- `Configuration.auth_settings()` never defines the `embyauth` scheme that the SDK's own endpoints ask
+  for, so authenticated requests go out with no `X-Emby-Token` header.
+- `get_users_itemaccess()` rejects the `ItemId` parameter, so per-playlist sharing cannot be read.
+
+`emby_mcp/sdk_patches.py` corrects both in memory when the package is imported. The installed SDK is
+never modified, so nothing has to be reapplied after `uv sync` and upgrading `embyclient` cannot
+silently revert the fixes.
+
+## Configuration
+
+Create a `.env` file in the project root. It is git-ignored, so your credentials stay local.
+
+```ini
+# Required
+EMBY_SERVER_URL="http://localhost:8096"
+EMBY_USERNAME="user"
+EMBY_PASSWORD="pass"
+
+# Optional
+EMBY_VERIFY_SSL=True
+LLM_MAX_ITEMS=100
 ```
 
-### Login Configuration
-The Emby login credentials must be stored in file ```".env"``` which you must create in ```\path\to\Emby.MCP``` (for security reasons it is NOT included in the git repo). 
-* Paste the following into the new ".env" file, amending for your own server as required:
-```
-#------------
-# Replace with your Emby server login details
-EMBY_SERVER_URL = "http://localhost:8096"
-EMBY_USERNAME = "user"
-EMBY_PASSWORD = "pass"
-# Set to False to NOT verify the server's SSL certificate (eg if self-signed). Defaults to True.
-EMBY_VERIFY_SSL = True
-# Each LLM has an upper limit on the amount of data it can ingest per tool call.
-# Set the max number of items returned per chunk by search tools (or 0 for no limit).
-# Items with rich metadata can average around 1,800 bytes each in JSON UTF8 format.
-LLM_MAX_ITEMS = 100
-#------------
-```
-* You may want to create a dedicated Emby user for Emby.MCP so that you can limit what it can do and what it can see. 
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `EMBY_SERVER_URL` | yes | — | Base URL of your Emby server, including scheme and port |
+| `EMBY_USERNAME` | yes | — | Emby account the server logs in as |
+| `EMBY_PASSWORD` | yes | — | Password for that account |
+| `EMBY_VERIFY_SSL` | no | `True` | Set false for a self-signed certificate. Accepts `true/1/yes/y/on` |
+| `LLM_MAX_ITEMS` | no | `100` | Maximum items per search chunk. Must be a positive whole number; anything else falls back to the default |
 
-### Basic Checks
-At this point the script should be able to run some startup checks by accessing your Emby server.
-* From a Powershell terminal, run:
-```
-cd "\path\to\Emby.MCP"
-uv run emby_mcp_server.py
-```
-* This should produce an output similar to this (depending on your Emby set up):
-```
-Emby.MCP Copyright (C) 2025 Dominic Search <code@angeltek.co.uk>
-This program comes with ABSOLUTELY NO WARRANTY. This is free software, and you are
-welcome to redistribute it under certain conditions; see LICENSE.txt for details.
+Any variable already set in the environment can be used instead of the file, and `--env` points any
+command at a different file.
 
-Running startup checks...
-Logon to media server was successful.
-Found 3 available libraries
-[
-  {
-    "name": "Music",
-    "type": "music",
-    "id": "23023"
-  },
-  {
-    "name": "Playlists",
-    "type": "playlists",
-    "id": "23033"
-  },
-  {
-    "name": "Movies",
-    "type": "movies",
-    "id": "23042"
-  },
-]
-Logout from media server was successful
-Startup checks have completed.
+> **Tip:** create a dedicated Emby user for this server so you can limit what it can see and do.
+> Note that listing Emby users — and therefore per-user playlist sharing — needs an account with
+> administrator rights; without them the user list comes back empty.
 
-Running Emby.MCP in standalone mode, press CTRL-C to exit.
-```
-* If this is successful, press Control-C or close the Powershell terminal to exit the script.
+### Tuning `LLM_MAX_ITEMS`
 
-### Configure Your LLM MCP Client
-* Add the Emby.MCP integration to the MCP SDK by running the following from a Powershell terminal:
+Items with rich metadata average roughly 1,800 bytes each as JSON. Every model has a per-tool-call
+ingestion limit, so this setting trades round trips against the risk of the client refusing an
+oversized response. Lower it if searches get truncated or refused.
+
+## Quick start
+
+Verify the installation before wiring up a client:
+
+```bash
+uv run emby-mcp test-connection     # authenticate and log out again
+uv run emby-mcp list-libraries      # list libraries with their IDs
+uv run emby-mcp search "star" -L Movies --limit 5
 ```
-cd \path\to\Emby.MCP
-uv run mcp install --name "Emby" --with "embyclient" emby_mcp_server.py
+
 ```
-* Use the instructions below for your choice of client, If you use a client that is not listed here, then you will need to adapt these instructions yourself.
-#### Claude Desktop
-Claude is a good choice as a general-purpose LLM chatbot that works well with Emby.MCP, but requires payment. 
-* Install the [latest Claude Desktop app](https://claude.ai/download) on the same machine that you installed Python.
-* You will need to have at least a [Pro subscription](https://claude.ai/login#pricing) - the free plan does not support MCP, unfortunately :-| 
-* Edit file ```%USERPROFILE%\AppData\Roaming\Claude\claude_desktop_config.json``` (Clicking through ```Claude Desktop > File menu > Settings > Developer > Edit Config``` will open File Explorer on this file - edit it in Notepad or whatever). Modify so that it looks something like this, noting that on Windows path separators **must** be escaped as ```\\``` :
+Library                        Type            ID
+-------------------------------------------------------------------------------------
+Movies                         movies          96047
+TV Shows                       tvshows         96049
+Audiobooks                     audiobooks      16887632
+...
+✓ Found 11 libraries
 ```
+
+## Connecting an AI client
+
+The server speaks MCP over stdio. Every client needs the same thing: run `emby-mcp serve` with this
+project as the working directory.
+
+### Claude Desktop
+
+Open **Settings → Developer → Edit Config** and add:
+
+```json
 {
   "mcpServers": {
     "Emby": {
-      "command": "uv.exe",
-      "args": [
-        "run",
-        "--directory",
-        "C:\\path\\to\\Emby.MCP",
-        "--with",
-        "embyclient",
-        "--with",
-        "mcp[cli]",
-        "mcp",
-        "run",
-        "emby_mcp_server.py"
-      ]
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/Emby.MCP", "emby-mcp", "serve"]
     }
   }
 }
 ```
-* Ensure Claude Desktop is fully shutdown (File menu > Exit) and then (re)start it.
-* Note: if you start Claude Desktop at any time when your Emby server is unavailable then you will get an error message. This is especially the case if Claude is set to "Run on Startup" and your Emby server is installed on the same computer (Claude may start before Emby). Claude will continue to function correctly without Emby.MCP - just restart Claude when the Emby server becomes available.
-* If you get an error message on first-time start up for any other reason, double-check the path in ```claude_desktop_config.json``` above, especially that it uses ```\\``` not single ```\``` in the directory path.
-* Emby.MCP sends messages about serious errors to the standard error output which Claude writes to its log files, so read through ```%USERPROFILE%\AppData\Roaming\Claude\logs\mcp-server-Emby.log``` and ```%USERPROFILE%\AppData\Roaming\Claude\logs\mcp.log``` looking for clues. This can be frustrating!
-#### Microsoft Visual Studio Code
-Visual Studio Code is a good choice for developers - it integrates with MS Copilot and works reasonably well with Emby.MCP
-* Install the [latest VS Code app](https://code.visualstudio.com/Download) on the same machine that you installed Python. You need at least v1.102 for full MCP support.
-* You will need to have a [Copilot](https://github.com/copilot) enabled [github account](https://github.com/signup), along with the relevant VS Code extentions installed & working. You do **not** need a pay-for Copilot Pro subscription - the free plan supports MCP, however you may run into monthly usage limits.
-* Use the official documentation to [Add an MCP Server](https://code.visualstudio.com/docs/copilot/chat/mcp-servers#_add-an-mcp-server), perhaps via [your user configuration](https://code.visualstudio.com/docs/copilot/chat/mcp-servers#_add-an-mcp-server-to-your-user-configuration)
-* Modify the ```mcp.json``` file so that it looks something like this, noting that on Windows path separators **must** be escaped as ```\\``` :
-```
+
+On Windows use `"uv.exe"` and escape path separators as `\\`:
+
+```json
 {
-	"servers": {
-		"Emby": {
-			"command": "uv.exe",
-			"args": [
-				"run",
-				"--directory",
-				"C:\\path\\to\\Emby.MCP",
-				"--with",
-				"embyclient",
-				"--with",
-				"mcp[cli]",
-				"mcp",
-				"run",
-				"emby_mcp_server.py"
-			]
-		}
-	}
+  "mcpServers": {
+    "Emby": {
+      "command": "uv.exe",
+      "args": ["run", "--directory", "C:\\path\\to\\Emby.MCP", "emby-mcp", "serve"]
+    }
+  }
 }
 ```
-* Start and use the Emby.MCP server per the [offcial VS Code documentation](https://code.visualstudio.com/docs/copilot/chat/mcp-servers#_use-mcp-tools-in-agent-mode).
 
-## Usage
-### Allow The Client to Use Tools 
-The first time an MCP client like Claude Desktop or VS Code tries to use a new MCP tool, a pop-up will appear asking for permission to use it. To avoid being asked each time, press or select ```Allow always```.
-### Starting a Conversation:
-It's a good idea to select an Emby library at the start of a conversation in order to narrow search results and reduce the amount of return data that the LLM has to deal with (that said, you can search across multiple libraries if you wish). E.g., from Claude:
+Fully quit Claude Desktop (File → Exit, not just closing the window) and reopen it. MCP requires a paid
+plan; the free tier does not support it.
 
->> **list emby libraries**
-> 
-> I'll help you explore your Emby library. Let me start by checking what libraries are available on your Emby server.
-> 
-> Your Emby server has several libraries available:
-> 
-> *   **Music** - Main music library
-> *   **Playlists** - Your saved playlists
-> *   **Movies** - Movie collection
-> *   **BBC Sounds** - BBC audio content
-> 
->> **select bbc library**
-> 
-> Perfect! I've selected the **BBC Sounds** library.
-> 
-> You can now search, browse, or explore content within the BBC Sounds library. What would you like to do next?
+### VS Code / GitHub Copilot
 
-### Instructing Your LLM
-On startup, the MCP client receives the list of tools from Emby.MCP (all functions that have ```@mcp.tool()``` 
-immediately prior to their ```def``` line), along with the parameter names and the content of the docstring.
+Requires VS Code 1.102 or newer. Follow
+[Add an MCP Server](https://code.visualstudio.com/docs/copilot/chat/mcp-servers#_add-an-mcp-server) and
+put the same command in `mcp.json`:
 
-The docstring is a natural language description of the tool, its parameters and its output. From this, the LLM
-gains an understanding of the capabilities it has at hand, and is quite good at reasoning which tools are 
-required for the instructions that you give it. But it isn't perfect, so:
-* Be brief and specific to reduce LLM confusion.
-* Start a conversation by mentioning Emby as a hint that Emby.MCP tools should be used.
-* If you want to search for audio or video based on a phrase in the **lyrics** or **description** then be explicit
-about this in your instructions, otherwise the LLM may only search on Title or Artist.
-* LLMs attempt not to ingest large amounts of data, such as from a vague search of a large library. Emby.MCP 
-works around this by returning results in bite-sized chunks. Sometimes even this is insufficient, so your instructions 
-may need get creatively persuasive. 
+```json
+{
+  "servers": {
+    "Emby": {
+      "command": "uv",
+      "args": ["run", "--directory", "/absolute/path/to/Emby.MCP", "emby-mcp", "serve"]
+    }
+  }
+}
+```
 
-### Example Transcript
-My Emby server contains a lot of BBC Radio audio drama files that have rich mp3/mp4 metadata, including a long
-description with full cast list in the Lyrics field. This is good material for demonstrating Emby.MCP...
-see the separate file [Example Claude Transcript.md](https://github.com/angeltek/Emby.MCP/blob/main/Example%20Claude%20Transcript.md) 
+Then use it from [agent mode](https://code.visualstudio.com/docs/copilot/chat/mcp-servers#_use-mcp-tools-in-agent-mode).
 
-## Under The Hood
-The Emby.MCP code is split over three files. ```emby_mcp_server.py``` contains all of the MCP related tool functions. In normal use, MCP does not require there be a classic 'main' function to call (although it is used here for testing purposes). Instead, the MCP Server SDK parses for functions declared as ```@mcp.tool()``` and offers these to the MCP client for direct calling. 
+### Any other client
 
-At client start-up some preliminaries are executed, which includes instantiating FastMCP with 'lifespan' function ```app_lifespan```.
-This is async code that logs into the Emby server, initialises some updateable 'context' storage (akin to a global variable), and then waits until either the client exits (causing ```app_lifespan``` to log out of Emby), or is prodded by other functions to yield its storage (tool functions can write as well as read the context storage).
+Point it at `uv run --directory /path/to/Emby.MCP emby-mcp serve` over stdio. The server reports itself
+as `Emby.MCP` and advertises the 20 tools listed above.
 
-The MCP tool functions are mostly thin wrappers to functions within ```lib_emby_functions.py``` where the heavy lifting takes place. These wrappers are written with LLM comprehension in mind, hence the rather long-form names for functions, parameters, and docstrings 
-(remember that the MCP SDK passes all this to the LLM so that it gains a detailed understanding of the tools). They only return 
-strings - either success/error messages or JSON formatted data. 
+## CLI reference
 
-The exception is search_for_item() and retrieve_next_search_chunk() which attempt to coax the LLM into accepting more data that it
-really wants to by chunking the return into bite-size pieces (defined by the ```LLM_MAX_ITEMS``` variable in the ```.env``` file).
+```
+uv run emby-mcp [--env PATH] [--debug] COMMAND
+```
 
-The functions in ```lib_emby_functions.py``` use Emby's official Client SDK, which does a good job of presenting the server's 
-REST API as Python objects. However it has a few minor bugs that, unpatched, prevent Emby.MCP from working correctly 
-(hence the need for the hotfixes given in installation instructions above). It should be noted that Emby's REST API documentation
-makes heavy use of CamelCaseNames, whereas the SDK mostly uses lower_case_delinated_names, so a good read-through of the SDK code
-files is necessary to figure out how to name things correctly.
+| Command | Purpose |
+|---|---|
+| `serve` | Run the MCP server over stdio. This is what AI clients invoke |
+| `test-connection` | Authenticate against Emby and report success or the failure reason |
+| `list-libraries` | List libraries with type and ID. `--format json` for machine-readable output |
+| `search QUERY` | Search for audio and video items. `--library/-L` to scope, `--limit/-l` to cap results |
+| `debug` | Interactive harness that exercises the underlying Emby functions against a live server |
+| `version` | Show the version, Python version, and platform |
 
-File ```lib_emby_debugging.py``` contains some rudimentary interactive testing of the ```lib_emby_functions.py``` functions.
-They are not full unit tests, but hey, there is only so much effort I wanted to expend in this round of developing a personal project. 
-To activate them, set ```MY_DEBUG=True``` at top of ```emby_mcp_server.py```, then interactively run *that* script (not ```lib_emby_debugging.py```). 
+Global options: `--env/-e` selects a `.env` file, `--debug/-d` enables debug mode.
 
-The tests write to standard output so that it can be redirected to a file to capture full data that the interactive terminal may otherwise truncate.  Prompts & errors messages are sent to standard error so that interaction is still possible during redirection.
-Enable the different test blocks in ```lib_emby_debugging.py``` by setting ```if True:``` instead of ```if False:``` at their start.
+## Usage tips
 
-To debug the MCP tools, either install the interactive client included in the SDK, which requires you have a working Node.js 
-environment. Or get the LLM client to perform tests for you, which may mean wading through LLM log files when things break badly 
-(Emby.MCP sends messages about serious problems to standard error, which some MCP clients will obligingly write to log files).
+The client receives each tool's name, parameters and docstring at startup and reasons about which to
+call. That works well, but a few habits help:
 
-## Also See
-* [Model Context Protocol](https://modelcontextprotocol.io/)
-* [a16z podcast with MCP Co-Creator, David Soria Parra](https://a16z.com/podcast/mcp-co-creator-on-the-next-wave-of-llm-innovation/)
-* [Emby Server REST API documentation](https://dev.emby.media/reference/RestAPI.html)
-* [Emby REST API Clients documentation](https://dev.emby.media/home/sdk/apiclients/index.html)
+- **Name Emby in your first message.** It cues the client to reach for these tools.
+- **Select a library early.** It narrows searches and cuts the volume of data the model has to read.
+- **Say "lyrics" or "description" explicitly** when you want a free-text search of that metadata,
+  otherwise the client will usually search only titles and artists.
+- **Be brief and specific.** Vague requests against a large library produce results the model may
+  refuse to ingest, even chunked.
+- **Approve tools once.** Choose *Allow always* at the first permission prompt for each tool.
+
+A session usually opens like this:
+
+> **list emby libraries**
+>
+> Your Emby server has several libraries available: **Music**, **Playlists**, **Movies**, **BBC Sounds**.
+>
+> **select the bbc library**
+>
+> I've selected the **BBC Sounds** library. What would you like to do next?
+
+## Architecture
+
+```
+emby_mcp_server.py        MCP tool definitions, FastMCP instance, lifespan, entry points
+emby_mcp/
+├── functions.py          Emby API layer — all the real work
+├── sdk_patches.py        Runtime corrections to the embyclient SDK
+├── config.py             EmbyConfig, reads .env and the environment
+├── debug.py              Interactive developer harness
+├── server.py             Re-export shim so the server is importable as emby_mcp.server
+└── cli/main.py           The emby-mcp Typer CLI
+```
+
+**Lifespan and context.** `app_lifespan` runs once at client startup: it logs into Emby and yields a
+context dict holding the API client, user ID, cached library list, current library, and search chunking
+state. Tools read and write that context through `mcp.get_context()`. When the client exits, the same
+function logs out.
+
+**Tools are thin.** Each `@mcp.tool()` function validates arguments, calls into `functions.py`, and
+returns a string — either a status message or JSON. The long names and detailed docstrings exist
+because the MCP SDK ships them to the model as the tool's entire specification.
+
+**Chunked search.** `search_for_item` fetches a full result set, stores it in the lifespan context, and
+returns the first `LLM_MAX_ITEMS` items along with `search_id`, `chunk_number` and
+`more_chunks_available`. The client calls `retrieve_next_search_chunk` until the results are exhausted,
+at which point the stored set is cleared.
+
+**Emby quirks worth knowing.** The REST API documents `CamelCaseNames` while the SDK uses
+`lower_case_names`. Emby also strips leading articles, so searching `"The Life"` and `"Life"` return
+identical results, and `"the"` alone matches nothing. Genre filters are sent without a media-type
+filter because Emby returns HTTP 500 when the two are combined; the media-type restriction is applied
+client-side instead.
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest                                    # 301 tests
+uv run pytest --cov --cov-report=term-missing    # 100% coverage
+```
+
+The suite mocks the Emby SDK throughout, so no live server is needed. An autouse fixture blocks `.env`
+discovery so a local configuration cannot leak into a test run.
+
+`emby_mcp/debug.py` is excluded from coverage: it is an interactive harness that drives a live server
+and selects what to exercise through `if True:` edits. Reach it with `uv run emby-mcp debug`.
+
+To inspect the protocol directly, use the MCP Inspector from the SDK (requires Node.js), or read the
+client's log files — the server writes serious errors to stderr, which most clients capture.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Client shows an Emby error at startup | The Emby server was unreachable when the client launched. The client keeps working without these tools; restart it once Emby is up |
+| `Fatal error: missing required environment variables` | `.env` is absent or incomplete. Check `EMBY_SERVER_URL`, `EMBY_USERNAME`, `EMBY_PASSWORD` |
+| SSL certificate errors | Set `EMBY_VERIFY_SSL=False` if your server uses a self-signed certificate |
+| `retrieve_user_list` returns nothing | The account lacks administrator rights, which Emby requires to list users. Per-user playlist sharing needs the same |
+| Searches return truncated or refused results | Lower `LLM_MAX_ITEMS` |
+| Server fails to start on Windows | Check that `claude_desktop_config.json` escapes path separators as `\\` |
+
+## Credits
+
+Originally created by **Dominic Search** ([angeltek/Emby.MCP](https://github.com/angeltek/Emby.MCP)),
+inspired by Yoko Li's [Morse Code MCP server](https://github.com/ykhli/mcp-light-control).
+This repository is a fork with a package restructure, a CLI, a test suite, and bug fixes.
+
+### Also see
+
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [Emby Server REST API documentation](https://dev.emby.media/reference/RestAPI.html)
+- [Emby REST API Clients documentation](https://dev.emby.media/home/sdk/apiclients/index.html)
+- [a16z podcast with MCP co-creator David Soria Parra](https://a16z.com/podcast/mcp-co-creator-on-the-next-wave-of-llm-innovation/)
 
 ## License
-Copyright (C) 2025 Dominic Search <code@angeltek.co.uk>
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, version 3 of the License.
+Copyright (C) 2025 Dominic Search &lt;code@angeltek.co.uk&gt;
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation, version 3 of the License.
 
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even
+the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+[GNU General Public License](LICENSE.txt) for more details.
